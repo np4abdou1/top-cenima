@@ -246,7 +246,8 @@ def get_trailer_embed_url(page_url: str, form_url: str) -> Optional[str]:
         trailer_endpoint = base + "/wp-content/themes/movies2023/Ajaxat/Home/LoadTrailer.php"
         
         # Use form_url exactly as provided (no modification)
-        data = f"href={requests.utils.quote(form_url)}"
+        # Use safe=':/' to preserve URL structure and encoding='utf-8' for Arabic
+        data = f"href={requests.utils.quote(form_url, safe=':/', encoding='utf-8')}"
         log(f"Using form data URL: {form_url}", level="debug")
         
         # Exact headers that worked in curl
@@ -278,8 +279,11 @@ def get_trailer_embed_url(page_url: str, form_url: str) -> Optional[str]:
         
         log("No valid iframe src found in response", level="debug")
         return None
+    except UnicodeEncodeError as e:
+        log(f"Trailer encoding error (Arabic chars): {str(e)[:60]}", level="debug")
+        return None
     except Exception as e:
-        log(f"Trailer fetch error: {str(e)[:40]}", level="warning")
+        log(f"Trailer fetch error: {str(e)[:60]}", level="debug")
         return None
 
 def get_episode_servers(episode_id: str, referer: Optional[str] = None, total_servers: int = 10) -> List[Dict]:
