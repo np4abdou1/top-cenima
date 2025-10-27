@@ -1,9 +1,13 @@
+"""
+Enhanced TopCinema scraper that saves to SQLite database with resumable progress
+"""
 import json
 import os
 import re
 import time
-from typing import List, Dict, Optional, Tuple
-from urllib.parse import unquote, urlparse
+import sqlite3
+from typing import List, Dict, Optional
+from urllib.parse import unquote, urlparse, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import logging
@@ -16,22 +20,219 @@ from rich.text import Text
 from rich.table import Table
 
 console = Console()
-
-# Configure logging
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# ANSI color codes for modern terminal logging
-class Colors:
-    RESET = '\033[0m'
+class Database:
+    def __init__(self, db_path: str = "data/scraper.db"):
+        self.db_path = db_path
     
-    # Foreground colors
-    RED = '\033[31m'
-    GREEN = '\033[32m'
-    YELLOW = '\033[33m'
-    CYAN = '\033[36m'
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+    
+    def slugify(self, text: str) -> str:
+        """Convert text to URL-friendly slug"""
+        import re
+        text = text.lower().strip()
+        text = re.sub(r'[^\w\s-]', '', text)
+        text = re.sub(r'[-\s]+', '-', text)
+        return text[:100]
+    
+    def insert_show(self, show_data: Dict) -> Optional[int]:
+        """Insert show and return ID"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            title = show_data.get("title")
+            slug = self.slugify(title)
+            metadata = show_data.get("metadata", {})
+            
+            # Convert lists to comma-separated strings
+            def to_string(value):
+                if isinstance(value, list):
+                    return ", ".join(str(v) for v in value if v)
+                return str(value) if value else None
+            
+            # Extract year from metadata or title
+            year = show_data.get("year")
+            if not year:
+                # Try to get from metadata
+                year_str = metadata.get("release_year") or metadata.get("year")
+                if year_str:
+                    import re
+                    match = re.search(r'(\d{4})', str(year_str))
+                    if match:
+                        year = int(match.group(1))
+            
+            cursor.execute("""
+            INSERT INTO shows (title, slug, type, poster, synopsis, imdb_rating, trailer, year, 
+                             genres, cast, directors, country, language, duration, source_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                title,
+                slug,
+                show_data.get("type"),
+                show_data.get("poster"),
+                show_data.get("synopsis"),
+                show_data.get("imdb_rating"),
+                show_data.get("trailer"),
+                year,
+                to_string(metadata.get("genres")),
+                to_string(metadata.get("cast")),
+                to_string(metadata.get("directors")),
+                to_string(metadata.get("country")),
+                to_string(metadata.get("language")),
+                to_string(metadata.get("duration")),
+                show_data.get("source_url")
+            ))
+            show_id = cursor.lastrowid
+            
+            conn.commit()
+            return show_id
+        except sqlite3.IntegrityError as e:
+            console.print(f"[yellow]Show '{show_data.get('title')}' already exists[/yellow]")
+            return None
+        finally:
+            conn.close()
+    
+    def insert_seasons_and_episodes(self, show_id: int, seasons: List[Dict]):
+        """Insert seasons, episodes and servers for a show"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            for season in seasons:
+                season_num = season.get("season_number", 1)
+                season_poster = season.get("poster")
+                
+                # Insert season
+                cursor.execute("""
+                INSERT OR IGNORE INTO seasons (show_id, season_number, poster)
+                VALUES (?, ?, ?)
+                """, (show_id, season_num, season_poster))
+                
+                season_id = cursor.lastrowid
+                if season_id == 0:  # Already exists, get the ID
+                    cursor.execute("""
+                    SELECT id FROM seasons WHERE show_id = ? AND season_number = ?
+                    """, (show_id, season_num))
+                    result = cursor.fetchone()
+                    if result:
+                        season_id = result[0]
+                
+                # Insert episodes
+                for episode in season.get("episodes", []):
+                    cursor.execute("""
+                    INSERT OR IGNORE INTO episodes (season_id, episode_number)
+                    VALUES (?, ?)
+                    """, (season_id, episode.get("episode_number")))
+                    
+                    episode_id = cursor.lastrowid
+                    if episode_id == 0:  # Already exists, get the ID
+                        cursor.execute("""
+                        SELECT id FROM episodes WHERE season_id = ? AND episode_number = ?
+                        """, (season_id, episode.get("episode_number")))
+                        result = cursor.fetchone()
+                        if result:
+                            episode_id = result[0]
+                    
+                    # Insert servers
+                    for server in episode.get("servers", []):
+                        cursor.execute("""
+                        INSERT INTO servers (episode_id, server_number, embed_url)
+                        VALUES (?, ?, ?)
+                        """, (episode_id, server.get("server_number"), server.get("embed_url")))
+            
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def insert_movie_servers(self, show_id: int, servers: List[Dict]):
+        """Insert servers for a movie (movies don't have seasons/episodes)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            # Create a dummy season and episode for movies
+            cursor.execute("""
+            INSERT OR IGNORE INTO seasons (show_id, season_number)
+            VALUES (?, 1)
+            """, (show_id,))
+            
+            season_id = cursor.lastrowid
+            if season_id == 0:
+                cursor.execute("SELECT id FROM seasons WHERE show_id = ? AND season_number = 1", (show_id,))
+                result = cursor.fetchone()
+                if result:
+                    season_id = result[0]
+            
+            cursor.execute("""
+            INSERT OR IGNORE INTO episodes (season_id, episode_number)
+            VALUES (?, 1)
+            """, (season_id,))
+            
+            episode_id = cursor.lastrowid
+            if episode_id == 0:
+                cursor.execute("SELECT id FROM episodes WHERE season_id = ? AND episode_number = 1", (season_id,))
+                result = cursor.fetchone()
+                if result:
+                    episode_id = result[0]
+            
+            for server in servers:
+                cursor.execute("""
+                INSERT INTO servers (episode_id, server_number, embed_url)
+                VALUES (?, ?, ?)
+                """, (episode_id, server.get("server_number"), server.get("embed_url")))
+            
+            conn.commit()
+        finally:
+            conn.close()
+    
 
-# Compile regex patterns once for performance
+    def mark_progress(self, url: str, status: str, show_id: Optional[int] = None, error: Optional[str] = None):
+        """Update scraping progress"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+            INSERT OR REPLACE INTO scrape_progress (url, status, show_id, error_message, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (url, status, show_id, error))
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def get_pending_urls(self, json_file: str) -> List[str]:
+        """Get URLs that haven't been scraped yet from a JSON file"""
+        import json
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        all_urls = data if isinstance(data, list) else data.get("urls", [])
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Get completed URLs
+        cursor.execute("SELECT url FROM scrape_progress WHERE status = 'completed'")
+        completed = {row[0] for row in cursor.fetchall()}
+        conn.close()
+        
+        # Return only pending URLs
+        return [url for url in all_urls if url not in completed]
+    
+    def init_progress(self, urls: List[str]):
+        """Initialize progress tracking for URLs"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        for url in urls:
+            cursor.execute("INSERT OR IGNORE INTO scrape_progress (url, status) VALUES (?, 'pending')", (url,))
+        conn.commit()
+        conn.close()
+
+db = Database()
+
 REGEX_PATTERNS = {
     'number': re.compile(r'(\d+)'),
     'movie': re.compile(r'(\/فيلم-|\/film-|\/movie-|%d9%81%d9%8a%d9%84%d9%85)', re.IGNORECASE),
@@ -39,7 +240,6 @@ REGEX_PATTERNS = {
     'watch_suffix': re.compile(r'/watch/?$'),
     'title_prefix': re.compile(r'^(انمي|مسلسل)\s+'),
     'episode_id': re.compile(r'"id"\s*:\s*"(\d+)"'),
-    # Enhanced title cleaning - removes all common Arabic prefixes/suffixes
     'title_clean_prefix': re.compile(
         r'^\s*(فيلم|انمي|مسلسل|anime|film|movie|series)\s+',
         re.IGNORECASE | re.UNICODE
@@ -50,17 +250,55 @@ REGEX_PATTERNS = {
     )
 }
 
-def print_banner():
-    """Print styled banner with Rich"""
-    banner_text = Text("🔥 TopCinema Scraper v2.0 🔥", style="bold blue")
-    subtitle = Text("By Abdelrahman", style="dim")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Referer": "https://web7.topcinema.cam/",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+REQUEST_TIMEOUT = 15
+REQUEST_DELAY = 0.3
+
+SESSION = requests.Session()
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
     
-    banner = Panel.fit(
-        banner_text + "\n" + subtitle,
-        border_style="blue",
-        padding=(1, 4)
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=1.0,
+        status_forcelist=[429, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "POST"],
+        raise_on_status=False
     )
-    console.print(banner)
+    
+    adapter = HTTPAdapter(
+        pool_connections=50,
+        pool_maxsize=100,
+        max_retries=retry_strategy,
+        pool_block=False
+    )
+    SESSION.mount('https://', adapter)
+    SESSION.mount('http://', adapter)
+    
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception as e:
+    logger.warning(f"Failed to configure session adapter: {e}")
+
+VERIFY_SSL = os.environ.get('VERIFY_SSL', 'false').lower() == 'true'
+
+ARABIC_ORDINALS = {
+    "الاول": 1, "الأول": 1, "الثاني": 2, "ثاني": 2,
+    "الثالث": 3, "ثالث": 3, "الرابع": 4, "رابع": 4,
+    "الخامس": 5, "خامس": 5, "السادس": 6, "سادس": 6,
+    "السابع": 7, "سابع": 7, "الثامن": 8, "ثامن": 8,
+    "التاسع": 9, "تاسع": 9, "العاشر": 10, "عاشر": 10,
+}
 
 def log(msg: str, level: str = "info") -> None:
     """Enhanced logging with Rich"""
@@ -74,116 +312,11 @@ def log(msg: str, level: str = "info") -> None:
         console.print(f"[{timestamp}] {msg}", style="bold yellow")
     elif level == "error":
         console.print(f"[{timestamp}] {msg}", style="bold red")
-    elif level == "trailer":
-        console.print(f"[{timestamp}] 🎬 {msg}", style="cyan")
-    elif level == "season":
-        console.print(f"[{timestamp}] 📺 {msg}", style="cyan")
     elif level == "debug":
-        pass  # Hide debug logs
-    else:
-        console.print(f"[{timestamp}] {msg}")
-
-class EpisodeLogger:
-    """Minimal episode logging"""
-    def __init__(self):
-        self.episodes_found = {}
-        self.episodes_logged = set()
-        self.next_expected = 1
-    
-    def add_episode(self, ep_num: int, server_count: int):
-        """Add an episode to the logging queue"""
-        self.episodes_found[ep_num] = server_count
-        self._try_log_episodes()
-    
-    def _try_log_episodes(self):
-        """Log episodes in order"""
-        while self.next_expected in self.episodes_found and self.next_expected not in self.episodes_logged:
-            ep_num = self.next_expected
-            server_count = self.episodes_found[ep_num]
-            console.print(f"Episode {ep_num:2d} - {server_count:2d} servers", style="cyan")
-            self.episodes_logged.add(ep_num)
-            self.next_expected += 1
-    
-    def finalize(self):
-        """Log any remaining episodes"""
-        remaining = set(self.episodes_found.keys()) - self.episodes_logged
-        if remaining:
-            console.print("Additional episodes:", style="cyan")
-            for ep_num in sorted(remaining):
-                server_count = self.episodes_found[ep_num]
-                console.print(f"Episode {ep_num:2d} - {server_count:2d} servers", style="cyan")
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-    "Referer": "https://web7.topcinema.cam/",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-# Generic headers without cookies (more reliable)
-TRAILER_HEADERS = {
-    "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9,ar;q=0.8",
-    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "sec-ch-ua": "\"Google Chrome\";v=\"141\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"141\"",
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": "\"Windows\"",
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-    "x-requested-with": "XMLHttpRequest"
-}
-
-REQUEST_TIMEOUT = 15  # Reduced from 30 for faster failures
-REQUEST_DELAY = 0.3  # Reduced from 1 for faster scraping
-
-# Configure session with aggressive connection pooling and fast retry
-SESSION = requests.Session()
-try:
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-    
-    # Aggressive retry strategy - fail fast
-    retry_strategy = Retry(
-        total=2,  # Reduced from 3
-        backoff_factor=0.5,  # Reduced from 1
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "POST"],
-        raise_on_status=False
-    )
-    
-    # Increased pool size for better concurrency
-    adapter = HTTPAdapter(
-        pool_connections=50,  # Increased from 32
-        pool_maxsize=100,  # Increased from 64
-        max_retries=retry_strategy,
-        pool_block=False
-    )
-    SESSION.mount('https://', adapter)
-    SESSION.mount('http://', adapter)
-    
-    # Disable SSL warnings for speed
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except Exception as e:
-    logger.warning(f"Failed to configure session adapter: {e}")
-
-# SSL verification - configurable via environment variable
-VERIFY_SSL = os.environ.get('VERIFY_SSL', 'true').lower() == 'true'
-
-ARABIC_ORDINALS = {
-    "الاول": 1, "الأول": 1, "الثاني": 2, "ثاني": 2,
-    "الثالث": 3, "ثالث": 3, "الرابع": 4, "رابع": 4,
-    "الخامس": 5, "خامس": 5, "السادس": 6, "سادس": 6,
-    "السابع": 7, "سابع": 7, "الثامن": 8, "ثامن": 8,
-    "التاسع": 9, "تاسع": 9, "العاشر": 10, "عاشر": 10,
-}
+        pass
 
 def fetch_html(url: str) -> Optional[BeautifulSoup]:
-    """Fetch and parse HTML with improved error handling"""
+    """Fetch and parse HTML"""
     if not url.startswith(('http://', 'https://')):
         logger.error(f"Invalid URL scheme: {url}")
         return None
@@ -193,14 +326,8 @@ def fetch_html(url: str) -> Optional[BeautifulSoup]:
         resp = SESSION.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, verify=VERIFY_SSL)
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "html.parser")
-    except requests.exceptions.Timeout:
-        log(f"Timeout fetching {url}", level="error")
-    except requests.exceptions.HTTPError as e:
-        log(f"HTTP error {e.response.status_code} for {url}", level="error")
-    except requests.exceptions.RequestException as e:
-        log(f"Request failed for {url}: {str(e)[:50]}", level="error")
     except Exception as e:
-        log(f"Unexpected error fetching {url}: {str(e)[:50]}", level="error")
+        log(f"Request failed for {url}: {str(e)[:50]}", level="error")
     return None
 
 def extract_number_from_text(text: str) -> Optional[int]:
@@ -217,23 +344,18 @@ def extract_number_from_text(text: str) -> Optional[int]:
     return None
 
 def clean_title(title: str) -> str:
-    """Remove prefixes and suffixes from titles - Enhanced version"""
+    """Remove prefixes and suffixes from titles"""
     if not title:
         return title
     
-    # Remove prefix (فيلم, انمي, مسلسل, etc.)
     cleaned = REGEX_PATTERNS['title_clean_prefix'].sub('', title)
     
-    # Remove suffix (مترجم, اون لاين, etc.) - apply multiple times to catch all
     prev = ""
     while prev != cleaned:
         prev = cleaned
         cleaned = REGEX_PATTERNS['title_clean_suffix'].sub(' ', cleaned)
     
-    # Additional cleanup - remove multiple spaces and trim
     cleaned = ' '.join(cleaned.split())
-    
-    # Remove trailing/leading special chars
     cleaned = cleaned.strip(' -–—|:،؛')
     
     return cleaned
@@ -245,45 +367,49 @@ def get_trailer_embed_url(page_url: str, form_url: str) -> Optional[str]:
         base = f"{p.scheme}://{p.netloc}"
         trailer_endpoint = base + "/wp-content/themes/movies2023/Ajaxat/Home/LoadTrailer.php"
         
-        # Use form_url exactly as provided (no modification)
-        data = f"href={requests.utils.quote(form_url)}"
-        log(f"Using form data URL: {form_url}", level="debug")
+        # URL-encode the form_url for the POST data
+        # Use quote with safe=':/' to preserve URL structure but encode Arabic chars
+        encoded_form_url = quote(form_url, safe=':/')
+        data_str = f"href={encoded_form_url}"
+        data_bytes = data_str.encode('utf-8')
         
         # Exact headers that worked in curl
+        # Ensure referer is ASCII-safe by encoding it properly
+        safe_referer = quote(page_url, safe=':/')
         trailer_headers = {
             "accept": "*/*",
             "accept-language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
             "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "priority": "u=1, i",
             "sec-ch-ua": "\"Google Chrome\";v=\"141\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"141\"",
             "sec-ch-ua-platform": "\"Windows\"",
             "x-requested-with": "XMLHttpRequest",
-            "referer": page_url
+            "referer": safe_referer
         }
         
         resp = SESSION.post(trailer_endpoint, 
                           headers=trailer_headers, 
-                          data=data,
-                          timeout=REQUEST_TIMEOUT)
+                          data=data_bytes,
+                          timeout=REQUEST_TIMEOUT,
+                          verify=VERIFY_SSL)
         resp.raise_for_status()
-        
-        log(f"Trailer endpoint response: {resp.text[:200]}...", level="debug")
         
         soup = BeautifulSoup(resp.text, "html.parser")
         iframe = soup.find("iframe")
         if iframe and iframe.get("src"):
             trailer_src = iframe["src"].strip()
-            log(f"Found trailer iframe src: {trailer_src}", level="debug")
             return trailer_src
         
-        log("No valid iframe src found in response", level="debug")
         return None
     except Exception as e:
-        log(f"Trailer fetch error: {str(e)[:40]}", level="warning")
+        try:
+            error_msg = repr(e).encode('utf-8', errors='replace').decode('utf-8')[:50]
+        except:
+            error_msg = "Unknown error"
+        log(f"Trailer fetch error: {error_msg}", level="warning")
         return None
 
 def get_episode_servers(episode_id: str, referer: Optional[str] = None, total_servers: int = 10) -> List[Dict]:
-    """Fetch streaming servers for an episode via PHP endpoint"""
+    """Fetch streaming servers for an episode"""
     servers: List[Dict] = []
     if referer:
         p = urlparse(referer)
@@ -302,19 +428,32 @@ def get_episode_servers(episode_id: str, referer: Optional[str] = None, total_se
         server_headers["Referer"] = referer
 
     def fetch_one(i: int):
-        try:
-            data = {"id": str(episode_id), "i": str(i)}
-            resp = SESSION.post(server_url, headers=server_headers, data=data, timeout=5)  # Reduced from 8
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            iframe = soup.find("iframe")
-            if iframe and iframe.get("src") and iframe.get("src").strip():
-                return {"server_number": i, "embed_url": iframe.get("src").strip()}
-        except Exception:
-            pass
+        max_retries = 3
+        retry_delay = 0.5
+        
+        for attempt in range(max_retries):
+            try:
+                data = {"id": str(episode_id), "i": str(i)}
+                resp = SESSION.post(server_url, headers=server_headers, data=data, timeout=5, verify=VERIFY_SSL)
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, "html.parser")
+                iframe = soup.find("iframe")
+                if iframe and iframe.get("src") and iframe.get("src").strip():
+                    return {"server_number": i, "embed_url": iframe.get("src").strip()}
+                return None
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                else:
+                    return None
+            except Exception:
+                return None
+        
         return None
 
-    with ThreadPoolExecutor(max_workers=min(12, total_servers)) as ex:  # Increased from 8
+    with ThreadPoolExecutor(max_workers=min(12, total_servers)) as ex:
         futures = {ex.submit(fetch_one, i): i for i in range(total_servers)}
         for fut in as_completed(futures):
             res = fut.result()
@@ -350,9 +489,7 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
 
     episodes: List[Dict] = []
     seen = set()
-    episode_logger = EpisodeLogger()
 
-    # Find episode links
     anchors = soup.select('.allepcont .row > a')
     if not anchors:
         anchors = [x for x in soup.find_all('a') if (x.find(class_='epnum') or (x.get('title') and 'الحلقة' in x.get('title')))]
@@ -364,7 +501,6 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
             raw_href = a.get('href')
             ep_title = a.get('title', '')
             
-            # Extract episode number
             ep_num = None
             em = a.find('em')
             if em:
@@ -391,7 +527,6 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
             if not ep_num or ep_num == 0:
                 ep_num = 999
             
-            # Get poster
             ep_poster = None
             img = a.find('img')
             if img:
@@ -402,7 +537,6 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
                 return None
             seen.add(key)
             
-            # Fetch watch page
             watch_url = raw_href
             if not REGEX_PATTERNS['watch_suffix'].search(raw_href):
                 watch_url = raw_href.rstrip('/') + '/watch/'
@@ -417,9 +551,8 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
             if episode_id:
                 server_list = get_episode_servers(episode_id, referer=watch_url, total_servers=10)
             
-            # Log episode using the episode logger
             if ep_num != 999:
-                episode_logger.add_episode(ep_num, len(server_list))
+                console.print(f"Episode {ep_num:2d} - {len(server_list):2d} servers", style="cyan")
             
             return {
                 "episode_number": ep_num,
@@ -429,7 +562,7 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
             log(f"Error processing episode: {str(e)[:50]}", level="error")
             return None
 
-    with ThreadPoolExecutor(max_workers=10) as ex:  # Increased from 6
+    with ThreadPoolExecutor(max_workers=10) as ex:
         try:
             for res in ex.map(process_episode, anchors):
                 if res:
@@ -438,26 +571,21 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
             log(f"Error in thread pool: {str(e)}", level="error")
             raise
 
-    # Finalize episode logging
-    episode_logger.finalize()
-
     episodes.sort(key=lambda e: e.get("episode_number", 999))
-    
     episodes = [e for e in episodes if e.get("episode_number", 999) != 999]
     
     return episodes
 
 def scrape_series(url: str) -> Optional[Dict]:
-    """Scrape series with correct episode URL format"""
+    """Scrape series"""
     soup = fetch_html(url)
     if not soup:
         return None
     
     details = extract_media_details(soup, "series")
 
-    # Scrape episodes for all seasons first
     seasons: List[Dict] = []
-    season_urls: Dict[int, str] = {}  # Track URLs temporarily
+    season_urls: Dict[int, str] = {}
     seen_urls = set()
     
     for s_el in soup.select('div.Small--Box.Season'):
@@ -477,7 +605,6 @@ def scrape_series(url: str) -> Optional[Dict]:
             s_num = extract_number_from_text(s_title)
         s_num = s_num or 1
         
-        # Fetch season poster from season page itself
         s_poster = None
         season_soup = fetch_html(s_url)
         if season_soup:
@@ -485,14 +612,13 @@ def scrape_series(url: str) -> Optional[Dict]:
             if poster_img:
                 s_poster = poster_img.get('src') or poster_img.get('data-src')
         
-        season_urls[s_num] = s_url  # Store URL temporarily
+        season_urls[s_num] = s_url
         seasons.append({
             "season_number": s_num,
             "poster": s_poster,
             "episodes": []
         })
 
-    # Fallback: scan for season URLs
     if not seasons:
         for a_el in soup.find_all('a', href=True):
             href = a_el['href']
@@ -503,7 +629,6 @@ def scrape_series(url: str) -> Optional[Dict]:
                 s_title = a_el.get('title') or a_el.get_text(strip=True) or ""
                 s_num = extract_number_from_text(s_title) or extract_number_from_text(href) or 1
                 
-                # Fetch season poster from season page
                 s_poster = None
                 season_soup = fetch_html(href)
                 if season_soup:
@@ -511,14 +636,13 @@ def scrape_series(url: str) -> Optional[Dict]:
                     if poster_img:
                         s_poster = poster_img.get('src') or poster_img.get('data-src')
                 
-                season_urls[s_num] = href  # Store URL temporarily
+                season_urls[s_num] = href
                 seasons.append({
                     "season_number": s_num,
                     "poster": s_poster,
                     "episodes": []
                 })
 
-    # Sort seasons
     seasons.sort(key=lambda s: s.get('season_number', 0))
 
     if not seasons:
@@ -529,13 +653,11 @@ def scrape_series(url: str) -> Optional[Dict]:
             "episodes": []
         })
 
-    # Scrape episodes for all seasons
     for season in seasons:
         s_num = season["season_number"]
         if s_num in season_urls:
             season["episodes"] = scrape_season_episodes(season_urls[s_num])
 
-    # Get first episode URL for trailer (temporary, not stored)
     episode_page_url = None
     if seasons:
         first_season_url = list(seen_urls)[0] if seen_urls else None
@@ -545,14 +667,11 @@ def scrape_series(url: str) -> Optional[Dict]:
                 first_ep_link = temp_soup.select_one(".allepcont .row > a")
                 if first_ep_link:
                     episode_page_url = first_ep_link.get("href")
-            
-    # Fetch trailer using exact episode page URL
+    
     trailer_url = None
     if episode_page_url:
-        log(f"Using exact episode URL for trailer: {episode_page_url}", level="debug")
         trailer_url = get_trailer_embed_url(url, episode_page_url)
     
-    # Now try trailer fetch using first episode's WATCH page URL
     if trailer_url:
         log("Trailer found", level="success")
     else:
@@ -566,11 +685,12 @@ def scrape_series(url: str) -> Optional[Dict]:
         "synopsis": details["synopsis"],
         "metadata": details["metadata"],
         "trailer": trailer_url,
+        "source_url": url,
         "seasons": seasons
     }
 
 def scrape_movie(url: str) -> Optional[Dict]:
-    """Scrape movie with proper trailer URL handling"""
+    """Scrape movie"""
     if not REGEX_PATTERNS['movie'].search(url):
         log(f"URL {url} doesn't appear to be a movie", level="error")
         return None
@@ -582,7 +702,6 @@ def scrape_movie(url: str) -> Optional[Dict]:
     
     details = extract_media_details(details_soup, "movie")
     
-    # Get servers using get_episode_servers (same functionality)
     watch_url = url.rstrip('/') + '/watch/'
     watch_soup = fetch_html(watch_url)
     if not watch_soup:
@@ -591,8 +710,7 @@ def scrape_movie(url: str) -> Optional[Dict]:
     episode_id = extract_episode_id_from_watch_page(watch_soup)
     servers = get_episode_servers(episode_id, referer=watch_url) if episode_id else []
     
-    # For movies, use original URL without /watch/
-    trailer_url = get_trailer_embed_url(url, url)  # Pass same URL for page and form data
+    trailer_url = get_trailer_embed_url(url, url)
     
     if trailer_url:
         log("Trailer found", level="success")
@@ -613,6 +731,7 @@ def scrape_movie(url: str) -> Optional[Dict]:
         "synopsis": story_txt,
         "metadata": details["metadata"],
         "trailer": trailer_url,
+        "source_url": url,
         "streaming_servers": servers,
         "scraped_at": datetime.now().isoformat()
     }
@@ -628,27 +747,23 @@ def extract_media_details(soup: BeautifulSoup, media_type: str) -> Dict:
     }
     
     try:
-        # Title
         title_el = soup.find("h1", class_="post-title")
         if title_el:
             title = title_el.get_text(strip=True)
             details["title"] = clean_title(title)
         
-        # Poster
         poster_wrap = soup.find('div', class_='image')
         if poster_wrap:
             img_tag = poster_wrap.find('img')
             if img_tag:
                 details["poster"] = img_tag.get('src') or img_tag.get('data-src')
         
-        # Story
         story = soup.find('div', class_='story')
         if story:
             p = story.find('p')
             if p:
                 details["synopsis"] = p.get_text(strip=True)
         
-        # IMDb rating
         imdb_box = soup.select_one(".UnderPoster .imdbR")
         if imdb_box:
             sp = imdb_box.find("span")
@@ -658,7 +773,6 @@ def extract_media_details(soup: BeautifulSoup, media_type: str) -> Dict:
                 except ValueError:
                     pass
         
-        # Other details
         tax = soup.find('ul', class_='RightTaxContent')
         if tax:
             for li in tax.find_all('li'):
@@ -670,7 +784,6 @@ def extract_media_details(soup: BeautifulSoup, media_type: str) -> Dict:
     except Exception as e:
         log(f"Error extracting details: {str(e)}", level="error")
     
-    # Map Arabic keys to English in metadata (fix mutation bug)
     key_mapping = {
         "قسم المسلسل": "category",
         "قسم الفيلم": "category",
@@ -694,13 +807,10 @@ def extract_media_details(soup: BeautifulSoup, media_type: str) -> Dict:
         "بطولة": "cast"
     }
     
-    # Create new dict to avoid mutation during iteration
     mapped_metadata = {}
     for k, v in details["metadata"].items():
-        # Clean the key (remove extra spaces and colons)
         clean_key = k.strip().rstrip(':')
         new_key = key_mapping.get(clean_key, clean_key)
-        # Only add if it's a mapped key (English)
         if new_key in key_mapping.values():
             mapped_metadata[new_key] = v
     details["metadata"] = mapped_metadata
@@ -708,13 +818,9 @@ def extract_media_details(soup: BeautifulSoup, media_type: str) -> Dict:
     return details
 
 def run_single(url_input: str) -> Optional[Dict]:
-    """Main scraping function with comprehensive movie detection"""
+    """Main scraping function"""
     url = url_input.strip()
     
-    # Comprehensive movie URL pattern matching:
-    # 1. Arabic movie pattern (فيلم)
-    # 2. English movie pattern (film/movie)
-    # 3. URL-encoded Arabic movie pattern (%d9%81%d9%8a%d9%84%d9%85)
     if REGEX_PATTERNS['movie'].search(url):
         return scrape_movie(url)
     else:
@@ -729,68 +835,97 @@ def cleanup():
         logger.warning(f"Cleanup error: {e}")
 
 if __name__ == "__main__":
-    print_banner()
-    start_time = time.time()
-    result = None
+    import sys
     
-    try:
-        import sys
-        if len(sys.argv) > 1:
-            url_input = sys.argv[1]
-        else:
-            try:
-                url_input = input(f"{Colors.CYAN}🔗 Enter URL to test (series, anime, or movie): {Colors.RESET}").strip()
-            except EOFError:
-                log("No input provided", level="error")
-                sys.exit(1)
+    # Process both JSON files in order
+    json_files = [
+        "data/series_animes.json",
+        "data/movies.json"
+    ]
+    
+    total_success = 0
+    total_errors = 0
+    overall_start = time.time()
+    
+    for json_file in json_files:
+        if not os.path.exists(json_file):
+            console.print(f"[yellow]Warning: {json_file} not found, skipping...[/yellow]")
+            continue
         
-        if url_input:
-            log("🚀 Starting extraction...", level="info")
-            result = run_single(url_input)
-            if result:
-                os.makedirs('data', exist_ok=True)
-                with open('data/test_output.json', 'w', encoding='utf-8') as f:
-                    json.dump(result, f, ensure_ascii=False, indent=2)
-                
-                # Enhanced summary with Rich
-                summary_table = Table(show_header=True, header_style="bold blue")
-                summary_table.add_column("Field", style="dim")
-                summary_table.add_column("Value")
-                
-                summary_table.add_row("Title", result.get("title", "Unknown"))
-                summary_table.add_row("Type", result.get("type", "Unknown"))
-                
-                if result.get("type") != "movie":
-                    seasons_count = len(result.get("seasons", []))
-                    total_eps = sum(len(s.get("episodes", [])) for s in result.get("seasons", []))
-                    summary_table.add_row("Seasons", str(seasons_count))
-                    summary_table.add_row("Episodes", str(total_eps))
-                else:
-                    summary_table.add_row("Servers", str(len(result.get("streaming_servers", []))))
-                
-                elapsed = time.time() - start_time
-                summary_table.add_row("Time", f"{elapsed:.2f}s")
-                
-                console.print("\n[bold]Summary:[/bold]")
-                console.print(summary_table)
+        console.print(f"\n[bold magenta]{'='*60}[/bold magenta]")
+        console.print(f"[bold magenta]Processing: {json_file}[/bold magenta]")
+        console.print(f"[bold magenta]{'='*60}[/bold magenta]\n")
+        
+        # Get pending URLs (skip already completed)
+        urls = db.get_pending_urls(json_file)
+        
+        if not urls:
+            console.print(f"[green]✓ All URLs from {json_file} already scraped![/green]")
+            continue
+        
+        console.print(f"[bold blue]Found {len(urls)} pending URLs to scrape[/bold blue]")
+        
+        # Initialize progress tracking
+        db.init_progress(urls)
+        
+        # Scrape each URL
+        start_time = time.time()
+        success_count = 0
+        error_count = 0
+        
+        for idx, url in enumerate(urls, 1):
+            console.print(f"\n[bold cyan][{idx}/{len(urls)}] Scraping: {url}[/bold cyan]")
             
-            # Final status
-            status_style = "bold green" if result else "bold red"
-            status_msg = "✓ Extraction completed" if result else "✗ Extraction failed"
-            console.print(f"[{time.strftime('%H:%M:%S')}] {status_msg}", style=status_style)
+            try:
+                result = run_single(url)
+                if result:
+                    show_id = db.insert_show(result)
+                    if show_id:
+                        if result.get("type") in ["series", "anime"]:
+                            db.insert_seasons_and_episodes(show_id, result.get("seasons", []))
+                        else:
+                            db.insert_movie_servers(show_id, result.get("streaming_servers", []))
+                        
+                        db.mark_progress(url, "completed", show_id)
+                        success_count += 1
+                        total_success += 1
+                        console.print(f"[green]✓ Saved to database[/green]")
+                    else:
+                        db.mark_progress(url, "failed", error="Duplicate show")
+                        error_count += 1
+                        total_errors += 1
+                else:
+                    db.mark_progress(url, "failed", error="Scraping returned no data")
+                    error_count += 1
+                    total_errors += 1
+                    console.print(f"[red]✗ Failed to scrape[/red]")
+            except Exception as e:
+                db.mark_progress(url, "failed", error=str(e))
+                error_count += 1
+                total_errors += 1
+                console.print(f"[red]✗ Error: {str(e)[:100]}[/red]")
         
         elapsed = time.time() - start_time
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
         time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-        log(f"🏁 Execution completed in {time_str}", level="success")
+        
+        console.print(f"\n[bold]{json_file} Summary:[/bold]")
+        console.print(f"[green]✓ Completed: {success_count}[/green]")
+        console.print(f"[red]✗ Failed: {error_count}[/red]")
+        console.print(f"[cyan]⏱ Time: {time_str}[/cyan]")
     
-    except KeyboardInterrupt:
-        log("\n⚠️  Interrupted by user", level="warning")
-        sys.exit(130)
-    except Exception as e:
-        log(f"Fatal error: {str(e)}", level="error")
-        logger.exception("Detailed traceback:")
-        sys.exit(1)
-    finally:
-        cleanup()
+    # Overall summary
+    total_elapsed = time.time() - overall_start
+    total_minutes = int(total_elapsed // 60)
+    total_seconds = int(total_elapsed % 60)
+    total_time_str = f"{total_minutes}m {total_seconds}s" if total_minutes > 0 else f"{total_seconds}s"
+    
+    console.print(f"\n[bold magenta]{'='*60}[/bold magenta]")
+    console.print(f"[bold magenta]OVERALL SUMMARY[/bold magenta]")
+    console.print(f"[bold magenta]{'='*60}[/bold magenta]")
+    console.print(f"[green]✓ Total Completed: {total_success}[/green]")
+    console.print(f"[red]✗ Total Failed: {total_errors}[/red]")
+    console.print(f"[cyan]⏱ Total Time: {total_time_str}[/cyan]")
+    
+    cleanup()
