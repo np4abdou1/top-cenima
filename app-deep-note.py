@@ -1,12 +1,11 @@
 """
-TopCinema Scraper with Flask Web Dashboard
-Replaces 01_init_database.py and 02_scraper_with_db.py
-
-This single file runs a Flask server to provide:
-- A web UI to start/stop the scraper.
-- Real-time stats and logging.
-- A list of failed URLs.
-- A database viewer.
+TopCinema Scraper with Flask Web Dashboard - FIXED VERSION
+Fixes:
+1. Anime type now stored as 'anime' instead of 'series'
+2. Trailer fetching improved for series/anime
+3. Database viewer shows actual data with pagination
+4. Download scraper.db functionality added
+5. Enhanced stats page with more metrics
 """
 import json
 import os
@@ -19,14 +18,14 @@ from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from queue import Queue  # Added Queue for buffering fetched shows
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, Response, request
+from flask import Flask, jsonify, Response, request, send_file
 
 # --- Global State Management ---
 
-# Suppress flask logging to keep terminal clean
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
@@ -34,6 +33,7 @@ GLOBAL_STATE: Dict[str, Any] = {
     "scraper_running": False,
     "stop_scraper": False,
     "log_message": "Scraper is idle. Press 'Start' to begin.",
+    "log_buffer": [],  # New: accumulate logs
     "stats": {
         "total_sources": 0,
         "total_pending": 0,
@@ -41,33 +41,39 @@ GLOBAL_STATE: Dict[str, Any] = {
         "failed": 0,
         "series": 0,
         "movies": 0,
+        "anime": 0,
         "current_file": "N/A",
-        "failed_urls": []  # List of {'url': str, 'error': str}
+        "failed_urls": []
+    },
+    "test_stats": {
+        "fetching": 0,
+        "in_queue": 0,
+        "written": 0,
+        "failed": 0
     },
     "json_files": ["data/series_animes.json", "data/movies.json"],
-    "db_path": "data/scraper.db"
+    "db_path": "data/scraper.db",
+    "test_db_path": "data/test.db"
 }
 SCRAPER_THREAD = None
 
-# --- Database Initialization (from 01_init_database.py) ---
+# --- Database Initialization ---
 
 def init_database(db_path: str = "data/scraper.db"):
-    """Create 4-table database schema with progress tracking"""
+    """Create 4-table database schema with anime support"""
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # Enable foreign keys
     cursor.execute("PRAGMA foreign_keys = ON")
     
-    # TABLE 1: SHOWS
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS shows (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL UNIQUE,
         slug TEXT UNIQUE,
-        type TEXT NOT NULL CHECK(type IN ('movie', 'series')),
+        type TEXT NOT NULL CHECK(type IN ('movie', 'series', 'anime')),
         poster TEXT,
         synopsis TEXT,
         imdb_rating REAL,
@@ -86,7 +92,6 @@ def init_database(db_path: str = "data/scraper.db"):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_shows_type ON shows(type)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_shows_slug ON shows(slug)")
 
-    # TABLE 2: SEASONS
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS seasons (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +105,6 @@ def init_database(db_path: str = "data/scraper.db"):
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_seasons_show ON seasons(show_id)")
 
-    # TABLE 3: EPISODES
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS episodes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,7 +117,6 @@ def init_database(db_path: str = "data/scraper.db"):
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id)")
 
-    # TABLE 4: SERVERS
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS servers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,7 +129,6 @@ def init_database(db_path: str = "data/scraper.db"):
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_servers_episode ON servers(episode_id)")
 
-    # PROGRESS TABLE
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS scrape_progress (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,21 +146,19 @@ def init_database(db_path: str = "data/scraper.db"):
     conn.commit()
     conn.close()
 
-# --- Database Class (from 02_scraper_with_db.py) ---
+# --- Database Class ---
 
 class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
     
     def get_connection(self):
-        """Get a thread-safe connection."""
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
     
     def slugify(self, text: str) -> str:
-        """Convert text to URL-friendly slug"""
         text = text.lower().strip()
         text = re.sub(r'[^\w\s-]', '', text)
         text = re.sub(r'[-\s]+', '-', text)
@@ -186,10 +186,7 @@ class Database:
                     if match:
                         year = int(match.group(1))
             
-            # Force type to 'movie' or 'series' as 'anime' is not in schema
             show_type = show_data.get("type", "series")
-            if show_type == "anime":
-                show_type = "series"
 
             cursor.execute("""
             INSERT INTO shows (title, slug, type, poster, synopsis, imdb_rating, trailer, year, 
@@ -260,7 +257,6 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
-            # Create a dummy season and episode for movies
             cursor.execute("INSERT OR IGNORE INTO seasons (show_id, season_number) VALUES (?, 1)", (show_id,))
             season_id = cursor.lastrowid
             if season_id == 0:
@@ -301,7 +297,6 @@ class Database:
             conn.close()
 
     def get_all_urls_from_files(self, json_files: List[str]) -> Dict[str, List[str]]:
-        """Loads all URLs from all specified JSON files."""
         all_urls_map = {}
         total_count = 0
         for file_path in json_files:
@@ -310,10 +305,8 @@ class Database:
                     data = json.load(f)
                 
                 file_urls = data if isinstance(data, list) else data.get("urls", [])
-                if file_path.endswith("series_animes.json"):
-                    # Handle the specific format from user prompt
-                    if isinstance(data, dict) and "series_animes" in data:
-                        file_urls = data["series_animes"]
+                if isinstance(data, dict) and "series_animes" in data:
+                    file_urls = data["series_animes"]
                 
                 all_urls_map[file_path] = file_urls
                 total_count += len(file_urls)
@@ -328,7 +321,6 @@ class Database:
         return all_urls_map
 
     def get_pending_urls(self, all_urls_map: Dict[str, List[str]]) -> Dict[str, List[str]]:
-        """Filters the URL map to only include pending URLs."""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -352,7 +344,6 @@ class Database:
         return pending_urls_map
 
     def init_progress(self, all_urls: List[str]):
-        """Initialize progress tracking for URLs"""
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
@@ -364,7 +355,36 @@ class Database:
         finally:
             conn.close()
 
-# --- Scraper Logic (from 02_scraper_with_db.py) ---
+    def get_shows_paginated(self, page: int = 1, per_page: int = 10, show_type: str = None):
+        """Get shows with pagination"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            offset = (page - 1) * per_page
+            
+            if show_type:
+                cursor.execute("SELECT COUNT(*) as count FROM shows WHERE type = ?", (show_type,))
+            else:
+                cursor.execute("SELECT COUNT(*) as count FROM shows")
+            total = cursor.fetchone()['count']
+            
+            if show_type:
+                cursor.execute("""
+                    SELECT id, title, type, poster, imdb_rating, year, source_url, created_at 
+                    FROM shows WHERE type = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+                """, (show_type, per_page, offset))
+            else:
+                cursor.execute("""
+                    SELECT id, title, type, poster, imdb_rating, year, source_url, created_at 
+                    FROM shows ORDER BY created_at DESC LIMIT ? OFFSET ?
+                """, (per_page, offset))
+            
+            shows = [dict(row) for row in cursor.fetchall()]
+            return shows, total
+        finally:
+            conn.close()
+
+# --- Scraper Logic ---
 
 REGEX_PATTERNS = {
     'number': re.compile(r'(\d+)'),
@@ -386,9 +406,8 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 15
 REQUEST_DELAY = 0.3
-VERIFY_SSL = False # As per original script logic
+VERIFY_SSL = False
 
-# Setup persistent session
 SESSION = requests.Session()
 retry_strategy = requests.packages.urllib3.util.retry.Retry(
     total=3,
@@ -410,16 +429,16 @@ ARABIC_ORDINALS = {
 }
 
 def log_message(msg: str, level: str = "info") -> None:
-    """Update global state log"""
     timestamp = time.strftime("%H:%M:%S")
     level_map = {"info": "INFO", "success": "SUCCESS", "warning": "WARN", "error": "ERROR"}
-    GLOBAL_STATE['log_message'] = f"[{timestamp}] [{level_map.get(level, 'INFO')}] {msg}"
+    formatted_msg = f"[{timestamp}] [{level_map.get(level, 'INFO')}] {msg}"
+    GLOBAL_STATE['log_message'] = formatted_msg
     
-    # Also print to console for debugging if needed, but user wanted clean terminal
-    # print(GLOBAL_STATE['log_message']) 
+    GLOBAL_STATE['log_buffer'].append(formatted_msg)
+    if len(GLOBAL_STATE['log_buffer']) > 100:
+        GLOBAL_STATE['log_buffer'].pop(0)
 
 def fetch_html(url: str) -> Optional[BeautifulSoup]:
-    """Fetch and parse HTML"""
     if GLOBAL_STATE['stop_scraper']: return None
     if not url.startswith(('http://', 'https://')):
         log_message(f"Invalid URL scheme: {url}", level="error")
@@ -434,7 +453,6 @@ def fetch_html(url: str) -> Optional[BeautifulSoup]:
     return None
 
 def extract_number_from_text(text: str) -> Optional[int]:
-    """Extract number from Arabic or English text"""
     if not text: return None
     m = REGEX_PATTERNS['number'].search(text)
     if m: return int(m.group(1))
@@ -444,7 +462,6 @@ def extract_number_from_text(text: str) -> Optional[int]:
     return None
 
 def clean_title(title: str) -> str:
-    """Remove prefixes and suffixes from titles"""
     if not title: return title
     cleaned = REGEX_PATTERNS['title_clean_prefix'].sub('', title)
     prev = ""
@@ -455,7 +472,7 @@ def clean_title(title: str) -> str:
     return cleaned
 
 def get_trailer_embed_url(page_url: str, form_url: str) -> Optional[str]:
-    """Fetch trailer"""
+    """Improved trailer fetching with better error handling"""
     if GLOBAL_STATE['stop_scraper']: return None
     try:
         p = urlparse(page_url)
@@ -476,14 +493,15 @@ def get_trailer_embed_url(page_url: str, form_url: str) -> Optional[str]:
         soup = BeautifulSoup(resp.text, "html.parser")
         iframe = soup.find("iframe")
         if iframe and iframe.get("src"):
-            return iframe["src"].strip()
+            trailer_url = iframe["src"].strip()
+            if trailer_url and trailer_url.startswith(('http://', 'https://')):
+                return trailer_url
         return None
     except Exception as e:
         log_message(f"Trailer fetch error: {str(e)[:50]}", level="warning")
         return None
 
 def get_episode_servers(episode_id: str, referer: Optional[str] = None, total_servers: int = 10) -> List[Dict]:
-    """Fetch streaming servers for an episode"""
     if GLOBAL_STATE['stop_scraper']: return []
     servers: List[Dict] = []
     base = "https://web7.topcinema.cam"
@@ -492,7 +510,7 @@ def get_episode_servers(episode_id: str, referer: Optional[str] = None, total_se
             p = urlparse(referer)
             base = f"{p.scheme}://{p.netloc}"
         except Exception:
-            pass # Use default base
+            pass
     
     server_url = base + "/wp-content/themes/movies2023/Ajaxat/Single/Server.php"
     server_headers = {
@@ -530,7 +548,6 @@ def get_episode_servers(episode_id: str, referer: Optional[str] = None, total_se
     return servers
 
 def extract_episode_id_from_watch_page(soup: BeautifulSoup) -> Optional[str]:
-    """Extract episode ID from watch page HTML"""
     if not soup: return None
     li = soup.select_one(".watch--servers--list li.server--item[data-id]")
     if li and li.has_attr("data-id"):
@@ -542,7 +559,6 @@ def extract_episode_id_from_watch_page(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 def scrape_season_episodes(season_url: str) -> List[Dict]:
-    """Scrape all episodes from a season page"""
     if GLOBAL_STATE['stop_scraper']: return []
     list_url = season_url.rstrip('/') + '/list/' if not season_url.endswith('/list/') else season_url
     
@@ -606,7 +622,6 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
     return episodes
 
 def extract_media_details(soup: BeautifulSoup) -> Dict:
-    """Shared function for extracting media details"""
     details = {
         "title": "Unknown", "poster": None, "synopsis": "",
         "imdb_rating": None, "metadata": {}
@@ -664,7 +679,6 @@ def extract_media_details(soup: BeautifulSoup) -> Dict:
     return details
 
 def scrape_series(url: str) -> Optional[Dict]:
-    """Scrape series"""
     if GLOBAL_STATE['stop_scraper']: return None
     soup = fetch_html(url)
     if not soup: return None
@@ -674,7 +688,6 @@ def scrape_series(url: str) -> Optional[Dict]:
     season_urls: Dict[int, str] = {}
     seen_urls = set()
     
-    # Prioritize 'Small--Box Season'
     for s_el in soup.select('div.Small--Box.Season'):
         a_el = s_el.find('a')
         if not a_el or not a_el.get('href'): continue
@@ -691,7 +704,6 @@ def scrape_series(url: str) -> Optional[Dict]:
         season_urls[s_num] = s_url
         seasons.append({"season_number": s_num, "poster": s_poster, "episodes": []})
 
-    # Fallback to other links
     if not seasons:
         for a_el in soup.find_all('a', href=True):
             href = a_el['href']
@@ -705,7 +717,6 @@ def scrape_series(url: str) -> Optional[Dict]:
 
     seasons.sort(key=lambda s: s.get('season_number', 0))
 
-    # If still no seasons, assume current page is season 1
     if not seasons:
         season_urls[1] = url
         seasons.append({"season_number": 1, "poster": details["poster"], "episodes": []})
@@ -716,7 +727,25 @@ def scrape_series(url: str) -> Optional[Dict]:
         if s_num in season_urls:
             season["episodes"] = scrape_season_episodes(season_urls[s_num])
 
-    trailer_url = get_trailer_embed_url(url, url)
+    trailer_url = None
+    episode_page_url = None
+    
+    # Get first episode's actual page URL from the season HTML
+    if season_urls:
+        first_season_url = list(season_urls.values())[0]
+        temp_soup = fetch_html(first_season_url)
+        if temp_soup:
+            first_ep_link = temp_soup.select_one(".allepcont .row > a")
+            if first_ep_link:
+                episode_page_url = first_ep_link.get("href")
+    
+    # Use episode page URL for trailer if found
+    if episode_page_url:
+        trailer_url = get_trailer_embed_url(url, episode_page_url)
+    
+    # Fallback to main URL if episode trailer didn't work
+    if not trailer_url:
+        trailer_url = get_trailer_embed_url(url, url)
 
     return {
         "title": details["title"], "type": "series", "imdb_rating": details["imdb_rating"],
@@ -725,7 +754,6 @@ def scrape_series(url: str) -> Optional[Dict]:
     }
 
 def scrape_movie(url: str) -> Optional[Dict]:
-    """Scrape movie"""
     if GLOBAL_STATE['stop_scraper']: return None
     
     details_soup = fetch_html(url)
@@ -751,41 +779,43 @@ def scrape_movie(url: str) -> Optional[Dict]:
     }
 
 def run_single(url_input: str, force_type: Optional[str] = None) -> Optional[Dict]:
-    """Main scraping function, modified to force type"""
+    """Properly handle anime/series/movie type detection based on URL pattern"""
     if GLOBAL_STATE['stop_scraper']: return None
     url = url_input.strip()
     
     result: Optional[Dict] = None
     
-    # Apply force_type logic
-    if force_type == 'series':
-        result = scrape_series(url)
-    elif REGEX_PATTERNS['movie'].search(url):
+    if "فيلم" in url or REGEX_PATTERNS['movie'].search(url):
         result = scrape_movie(url)
-    else:
+        if result:
+            result['type'] = 'movie'
+    elif "انمي" in url:
         result = scrape_series(url)
-    
-    # Ensure the forced type is set in the final result
-    if result and force_type:
-        result['type'] = force_type
+        if result:
+            result['type'] = 'anime'
+    elif "مسلسل" in url:
+        result = scrape_series(url)
+        if result:
+            result['type'] = 'series'
+    else:
+        # Fallback: try to determine by scraping
+        result = scrape_series(url)
+        if result:
+            result['type'] = 'series'
     
     return result
 
 # --- Scraper Control Thread ---
 
 def run_scraper_task():
-    """The main scraper task that runs in a thread."""
     try:
         db = Database(GLOBAL_STATE['db_path'])
         
-        # 1. Load all URLs from all files
         all_urls_map = db.get_all_urls_from_files(GLOBAL_STATE['json_files'])
         all_urls_list = [url for urls in all_urls_map.values() for url in urls]
         
-        # 2. Get *only* pending URLs
         pending_urls_map = db.get_pending_urls(all_urls_map)
         
-        # 3. Initialize progress for any *new* URLs
         db.init_progress(all_urls_list)
         
         log_message(f"Found {GLOBAL_STATE['stats']['total_pending']} pending items out of {GLOBAL_STATE['stats']['total_sources']} total.", level="info")
@@ -804,8 +834,6 @@ def run_scraper_task():
             GLOBAL_STATE['stats']['current_file'] = json_file
             log_message(f"Processing {len(urls)} items from {json_file}...", level="info")
             
-            # Determine if we need to force the type
-            current_force_type = "series" if "series_animes.json" in json_file else None
             
             for idx, url in enumerate(urls, 1):
                 if GLOBAL_STATE['stop_scraper']:
@@ -815,26 +843,27 @@ def run_scraper_task():
                 log_message(f"[{idx}/{len(urls)}] Scraping: {url}", level="info")
                 
                 try:
-                    result = run_single(url, force_type=current_force_type)
+                    result = run_single(url)
                     if result:
                         show_id = db.insert_show(result)
                         if show_id:
-                            if result.get("type") == "series":
+                            if result.get("type") in ["series", "anime"]:
                                 db.insert_seasons_and_episodes(show_id, result.get("seasons", []))
-                                GLOBAL_STATE['stats']['series'] += 1
-                            else: # movie
+                                if result.get("type") == "anime":
+                                    GLOBAL_STATE['stats']['anime'] += 1
+                                else:
+                                    GLOBAL_STATE['stats']['series'] += 1
+                            else:
                                 db.insert_movie_servers(show_id, result.get("streaming_servers", []))
                                 GLOBAL_STATE['stats']['movies'] += 1
                             
                             db.mark_progress(url, "completed", show_id)
                             GLOBAL_STATE['stats']['completed'] += 1
                         else:
-                            # Failed to insert (likely duplicate)
                             db.mark_progress(url, "failed", error="Duplicate or DB error")
                             GLOBAL_STATE['stats']['failed'] += 1
                             GLOBAL_STATE['stats']['failed_urls'].append({"url": url, "error": "Duplicate or DB Error"})
                     else:
-                        # Scraping returned no data
                         db.mark_progress(url, "failed", error="Scraping returned no data")
                         GLOBAL_STATE['stats']['failed'] += 1
                         GLOBAL_STATE['stats']['failed_urls'].append({"url": url, "error": "Scraping returned no data"})
@@ -856,13 +885,192 @@ def run_scraper_task():
         GLOBAL_STATE['stop_scraper'] = False
         GLOBAL_STATE['stats']['current_file'] = "N/A"
 
+def run_test_script_task():
+    """Run test script with 10 parallel fetchers and sequential writer"""
+    try:
+        import random
+        
+        db = Database(GLOBAL_STATE['db_path'])
+        db.init_database()
+        
+        # Load URLs from JSON files
+        anime_urls = []
+        series_urls = []
+        movie_urls = []
+        
+        for json_file in GLOBAL_STATE['json_files']:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    urls = [item['url'] for item in data if 'url' in item]
+                    
+                    if "series_animes" in json_file:
+                        for url in urls:
+                            if "انمي" in url:
+                                anime_urls.append(url)
+                            elif "مسلسل" in url:
+                                series_urls.append(url)
+                            elif "فيلم" in url:
+                                movie_urls.append(url)
+                    elif "movies" in json_file:
+                        movie_urls.extend(urls)
+            except Exception as e:
+                log_message(f"Error loading JSON file {json_file}: {e}", level="error")
+        
+        selected_urls = []
+        if anime_urls:
+            selected_urls.extend(random.sample(anime_urls, min(3, len(anime_urls))))
+            log_message(f"Selected {min(3, len(anime_urls))} anime URLs for testing", level="info")
+        else:
+            log_message("No anime URLs found in JSON files", level="warning")
+        
+        if series_urls:
+            selected_urls.extend(random.sample(series_urls, min(3, len(series_urls))))
+            log_message(f"Selected {min(3, len(series_urls))} series URLs for testing", level="info")
+        else:
+            log_message("No series URLs found in JSON files", level="warning")
+        
+        if movie_urls:
+            selected_urls.extend(random.sample(movie_urls, min(3, len(movie_urls))))
+            log_message(f"Selected {min(3, len(movie_urls))} movie URLs for testing", level="info")
+        else:
+            log_message("No movie URLs found in JSON files", level="warning")
+        
+        if not selected_urls:
+            log_message("No URLs selected for testing. Check JSON files.", level="error")
+            return
+        
+        log_message(f"Starting test script with {len(selected_urls)} URLs (10 parallel fetchers + sequential writer)", level="info")
+        
+        GLOBAL_STATE['test_stats'] = {
+            "fetching": 0,
+            "in_queue": 0,
+            "written": 0,
+            "failed": 0
+        }
+        
+        fetch_queue = Queue()
+        fetching_lock = threading.Lock()
+        
+        def fetcher_worker(url_list, worker_id):
+            """Fetch shows and add to queue - truly parallel"""
+            for url in url_list:
+                if GLOBAL_STATE['stop_scraper']:
+                    break
+                
+                with fetching_lock:
+                    GLOBAL_STATE['test_stats']['fetching'] += 1
+                
+                log_message(f"[WORKER {worker_id}] Fetching: {url}", level="info")
+                
+                try:
+                    result = run_single(url)
+                    if result:
+                        fetch_queue.put({"url": url, "result": result, "worker_id": worker_id})
+                        with fetching_lock:
+                            GLOBAL_STATE['test_stats']['fetching'] -= 1
+                            GLOBAL_STATE['test_stats']['in_queue'] += 1
+                        log_message(f"[WORKER {worker_id}] ✓ Queued: {result.get('title')}", level="success")
+                    else:
+                        with fetching_lock:
+                            GLOBAL_STATE['test_stats']['fetching'] -= 1
+                            GLOBAL_STATE['test_stats']['failed'] += 1
+                        log_message(f"[WORKER {worker_id}] ✗ Failed: {url}", level="error")
+                except Exception as e:
+                    with fetching_lock:
+                        GLOBAL_STATE['test_stats']['fetching'] -= 1
+                        GLOBAL_STATE['test_stats']['failed'] += 1
+                    log_message(f"[WORKER {worker_id}] ✗ Error: {str(e)[:60]}", level="error")
+        
+        def writer_worker():
+            """Write shows from queue to database one by one - truly sequential"""
+            while True:
+                try:
+                    item = fetch_queue.get(timeout=2)
+                    if item is None:
+                        break
+                    
+                    result = item['result']
+                    worker_id = item['worker_id']
+                    
+                    log_message(f"[WRITER] Writing: {result.get('title')}", level="info")
+                    
+                    try:
+                        show_id = db.insert_show(result)
+                        if show_id:
+                            if result.get("type") in ["series", "anime"]:
+                                db.insert_seasons_and_episodes(show_id, result.get("seasons", []))
+                            else:
+                                db.insert_movie_servers(show_id, result.get("streaming_servers", []))
+                            
+                            with fetching_lock:
+                                GLOBAL_STATE['test_stats']['in_queue'] -= 1
+                                GLOBAL_STATE['test_stats']['written'] += 1
+                            log_message(f"[WRITER] ✓ Written: {result.get('title')}", level="success")
+                        else:
+                            with fetching_lock:
+                                GLOBAL_STATE['test_stats']['in_queue'] -= 1
+                                GLOBAL_STATE['test_stats']['failed'] += 1
+                            log_message(f"[WRITER] ✗ DB insert failed", level="error")
+                    except Exception as e:
+                        with fetching_lock:
+                            GLOBAL_STATE['test_stats']['in_queue'] -= 1
+                            GLOBAL_STATE['test_stats']['failed'] += 1
+                        log_message(f"[WRITER] ✗ Error: {str(e)[:60]}", level="error")
+                    
+                    fetch_queue.task_done()
+                except queue.Empty:
+                    if fetch_queue.empty():
+                        break
+                except Exception as e:
+                    log_message(f"[WRITER] Fatal error: {str(e)[:60]}", level="error")
+                    break
+        
+        fetcher_threads = []
+        urls_per_worker = max(1, len(selected_urls) // 10)
+        
+        for worker_id in range(10):
+            start_idx = worker_id * urls_per_worker
+            end_idx = start_idx + urls_per_worker if worker_id < 9 else len(selected_urls)
+            worker_urls = selected_urls[start_idx:end_idx]
+            
+            if worker_urls:
+                t = threading.Thread(target=fetcher_worker, args=(worker_urls, worker_id + 1), daemon=False)
+                t.start()
+                fetcher_threads.append(t)
+        
+        # Start writer thread
+        writer_thread = threading.Thread(target=writer_worker, daemon=False)
+        writer_thread.start()
+        
+        # Wait for all fetchers to complete
+        for t in fetcher_threads:
+            t.join()
+        
+        log_message("All fetchers completed. Waiting for queue to empty...", level="info")
+        
+        # Wait for queue to be processed
+        fetch_queue.join()
+        
+        # Signal writer to stop
+        fetch_queue.put(None)
+        writer_thread.join()
+        
+        log_message(f"Test completed! Written: {GLOBAL_STATE['test_stats']['written']}, Failed: {GLOBAL_STATE['test_stats']['failed']}", level="success")
+
+    except Exception as e:
+        log_message(f"Fatal test script error: {e}", level="error")
+    finally:
+        GLOBAL_STATE['scraper_running'] = False
+        GLOBAL_STATE['stop_scraper'] = False
+
 # --- Flask Web Server ---
 
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    """Serves the main dashboard HTML."""
+    """Main dashboard with enhanced stats and test script button"""
     html = """
     <!DOCTYPE html>
     <html lang="en">
@@ -873,47 +1081,44 @@ def index():
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
                    background-color: #121212; color: #E0E0E0; margin: 0; padding: 20px; font-size: 16px; }
-            .container { max-width: 900px; margin: 0 auto; background-color: #1E1E1E; border: 1px solid #333;
+            .container { max-width: 1200px; margin: 0 auto; background-color: #1E1E1E; border: 1px solid #333;
                          border-radius: 8px; padding: 25px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
             h1 { color: #FFFFFF; border-bottom: 2px solid #444; padding-bottom: 10px; margin-top: 0; }
             h2 { color: #E0E0E0; border-bottom: 1px solid #333; padding-bottom: 8px; margin-top: 30px; }
-            .controls { margin-bottom: 20px; display: flex; gap: 15px; }
+            .controls { margin-bottom: 20px; display: flex; gap: 15px; flex-wrap: wrap; }
             button { background-color: #333; color: #E0E0E0; border: 1px solid #555; padding: 12px 20px;
                      border-radius: 5px; cursor: pointer; font-size: 16px; transition: all 0.2s ease; }
             button:hover { background-color: #444; border-color: #777; }
             button:disabled { background-color: #2a2a2a; color: #555; border-color: #444; cursor: not-allowed; }
-            #start-btn { background-color: #28a745; border-color: #28a745; color: #FFFFFF; }
-            #start-btn:hover { background-color: #218838; }
-            #stop-btn { background-color: #dc3545; border-color: #dc3545; color: #FFFFFF; }
-            #stop-btn:hover { background-color: #c82333; }
+            button.test-btn { background-color: #f39c12; }
+            button.test-btn:hover { background-color: #e67e22; }
             .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; }
             .stat-box { background-color: #2a2a2a; border: 1px solid #333; border-radius: 5px; padding: 15px; }
             .stat-box strong { display: block; font-size: 24px; color: #FFFFFF; }
             .stat-box span { font-size: 14px; color: #AAA; }
-            pre#log-message { background-color: #2a2a2a; border: 1px solid #333; padding: 15px; border-radius: 5px;
-                             white-space: pre-wrap; word-wrap: break-word; color: #E0E0E0; font-family: "Courier New", Courier, monospace;
-                             min-height: 2.5em; line-height: 1.6; }
-            #failed-urls { max-height: 300px; overflow-y: auto; background: #2a2a2a; border: 1px solid #333;
-                           border-radius: 5px; padding: 0 15px; }
-            #failed-urls div { border-bottom: 1px solid #333; padding: 10px 0; }
-            #failed-urls div:last-child { border-bottom: none; }
-            #failed-urls code { color: #dc3545; }
-            #failed-urls span { color: #AAA; display: block; font-size: 0.9em; }
-            nav { margin-bottom: 20px; }
-            nav a { color: #3498db; text-decoration: none; padding: 5px 10px; border-radius: 4px; }
-            nav a:hover { background-color: #333; }
-            nav a.active { font-weight: bold; background-color: #2a2a2a; }
+            #log-container { background-color: #2a2a2a; border: 1px solid #333; padding: 15px; border-radius: 5px;
+                            max-height: 400px; overflow-y: auto; font-family: "Courier New", Courier, monospace;
+                            font-size: 13px; line-height: 1.5; }
+            .log-line { color: #E0E0E0; padding: 2px 0; }
+            .log-line.success { color: #28a745; }
+            .log-line.error { color: #dc3545; }
+            .log-line.warning { color: #ffc107; }
+            .test-stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-top: 15px; }
+            .test-stat-box { background-color: #2a2a2a; border: 1px solid #444; border-radius: 5px; padding: 10px; text-align: center; }
+            .test-stat-box strong { display: block; font-size: 18px; color: #f39c12; }
+            .test-stat-box span { font-size: 12px; color: #AAA; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>TopCinema Scraper Dashboard</h1>
             <nav>
-                <a href="/" class="active">Dashboard</a> | <a href="/db-view">DB Viewer</a>
+                <a href="/" class="active">Dashboard</a> | <a href="/db-view">DB Viewer</a> | <a href="/stats">Stats</a>
             </nav>
             <div class="controls">
-                <button id="start-btn">Start Scraper</button>
-                <button id="stop-btn" disabled>Stop Scraper</button>
+                <button id="start-btn">▶ Start Scraper</button>
+                <button id="stop-btn" disabled>⏹ Stop Scraper</button>
+                <button id="test-btn" class="test-btn">🧪 Test Script (3+3+3)</button>
             </div>
             
             <h2>Live Stats</h2>
@@ -922,13 +1127,26 @@ def index():
                 <div class="stat-box"><strong id="pending">0</strong><span>Pending</span></div>
                 <div class="stat-box"><strong id="completed">0</strong><span>Completed</span></div>
                 <div class="stat-box"><strong id="failed">0</strong><span>Failed</span></div>
+                <div class="stat-box"><strong id="anime">0</strong><span>Anime</span></div>
                 <div class="stat-box"><strong id="series">0</strong><span>Series</span></div>
                 <div class="stat-box"><strong id="movies">0</strong><span>Movies</span></div>
                 <div class="stat-box"><strong id="total">0</strong><span>Total Sources</span></div>
             </div>
+            
+            <div class="progress-bar">
+                <div class="progress-fill" id="progress-fill" style="width: 0%">0%</div>
+            </div>
+
+            <h2>Test Script Status</h2>
+            <div class="test-stats-grid">
+                <div class="test-stat-box"><strong id="test-fetching">0</strong><span>Fetching</span></div>
+                <div class="test-stat-box"><strong id="test-queue">0</strong><span>In Queue</span></div>
+                <div class="test-stat-box"><strong id="test-written">0</strong><span>Written</span></div>
+                <div class="test-stat-box"><strong id="test-failed">0</strong><span>Failed</span></div>
+            </div>
 
             <h2>Live Log</h2>
-            <pre id="log-message">Waiting for status...</pre>
+            <div id="log-container"></div>
 
             <h2>Failed URLs</h2>
             <div id="failed-urls"><p>No failed URLs yet.</p></div>
@@ -937,175 +1155,368 @@ def index():
         <script>
             const startBtn = document.getElementById('start-btn');
             const stopBtn = document.getElementById('stop-btn');
-            const logMsg = document.getElementById('log-message');
+            const testBtn = document.getElementById('test-btn');
+            const logContainer = document.getElementById('log-container');
             const pending = document.getElementById('pending');
             const completed = document.getElementById('completed');
             const failed = document.getElementById('failed');
+            const anime = document.getElementById('anime');
             const series = document.getElementById('series');
             const movies = document.getElementById('movies');
             const total = document.getElementById('total');
             const currentFile = document.getElementById('current-file');
             const failedUrlsDiv = document.getElementById('failed-urls');
+            const progressFill = document.getElementById('progress-fill');
+            
+            const testFetching = document.getElementById('test-fetching');
+            const testQueue = document.getElementById('test-queue');
+            const testWritten = document.getElementById('test-written');
+            const testFailed = document.getElementById('test-failed');
 
             async function fetchStatus() {
                 try {
                     const response = await fetch('/api/status');
                     const data = await response.json();
                     
-                    // Update buttons
                     startBtn.disabled = data.scraper_running;
                     stopBtn.disabled = !data.scraper_running;
+                    testBtn.disabled = data.scraper_running;
 
-                    // Update log
-                    logMsg.textContent = data.log_message;
+                    const logs = data.log_buffer || [];
+                    logContainer.innerHTML = logs.map(log => {
+                        let className = 'log-line';
+                        if (log.includes('[SUCCESS]')) className += ' success';
+                        else if (log.includes('[ERROR]')) className += ' error';
+                        else if (log.includes('[WARN]')) className += ' warning';
+                        return `<div class="${className}">${log}</div>`;
+                    }).join('');
+                    logContainer.scrollTop = logContainer.scrollHeight;
 
-                    // Update stats
                     const stats = data.stats;
-                    pending.textContent = stats.total_pending - stats.completed - stats.failed;
+                    const remaining = stats.total_pending - stats.completed - stats.failed;
+                    pending.textContent = remaining > 0 ? remaining : 0;
                     completed.textContent = stats.completed;
                     failed.textContent = stats.failed;
+                    anime.textContent = stats.anime;
                     series.textContent = stats.series;
                     movies.textContent = stats.movies;
                     total.textContent = stats.total_sources;
                     currentFile.textContent = stats.current_file;
 
-                    // Update failed URLs
+                    if (stats.total_sources > 0) {
+                        const progress = ((stats.completed + stats.failed) / stats.total_sources) * 100;
+                        progressFill.style.width = progress + '%';
+                        progressFill.textContent = Math.round(progress) + '%';
+                    }
+
                     if (stats.failed_urls.length > 0) {
                         failedUrlsDiv.innerHTML = stats.failed_urls.map(item => 
-                            `<div>
-                                <code>${item.url}</code>
-                                <span>Error: ${item.error}</span>
-                            </div>`
+                            `<div><code>${item.url}</code><span>Error: ${item.error}</span></div>`
                         ).join('');
                     } else {
                         failedUrlsDiv.innerHTML = '<p>No failed URLs yet.</p>';
                     }
+                    
+                    const testStats = data.test_stats || {};
+                    testFetching.textContent = testStats.fetching || 0;
+                    testQueue.textContent = testStats.in_queue || 0;
+                    testWritten.textContent = testStats.written || 0;
+                    testFailed.textContent = testStats.failed || 0;
                 } catch (e) {
-                    logMsg.textContent = 'Error fetching status. Server might be down.';
+                    logContainer.innerHTML = '<div class="log-line error">Error fetching status</div>';
                 }
             }
 
             startBtn.addEventListener('click', async () => {
                 try {
                     await fetch('/api/start', { method: 'POST' });
-                    fetchStatus(); // Immediately update
+                    fetchStatus();
                 } catch (e) {
-                    logMsg.textContent = 'Error starting scraper.';
+                    logContainer.innerHTML = '<div class="log-line error">Error starting scraper</div>';
                 }
             });
 
             stopBtn.addEventListener('click', async () => {
                 try {
                     await fetch('/api/stop', { method: 'POST' });
-                    fetchStatus(); // Immediately update
+                    fetchStatus();
                 } catch (e) {
-                    logMsg.textContent = 'Error stopping scraper.';
+                    logContainer.innerHTML = '<div class="log-line error">Error stopping scraper</div>';
                 }
             });
 
-            setInterval(fetchStatus, 2000); // Poll every 2 seconds
-            fetchStatus(); // Initial fetch
+            testBtn.addEventListener('click', async () => {
+                try {
+                    await fetch('/api/test', { method: 'POST' });
+                    fetchStatus();
+                } catch (e) {
+                    logContainer.innerHTML = '<div class="log-line error">Error starting test script</div>';
+                }
+            });
+
+            setInterval(fetchStatus, 1000);
+            fetchStatus();
         </script>
     </body>
     </html>
     """
     return Response(html, mimetype='text/html')
 
+@app.route('/api/test', methods=['POST'])
+def api_test():
+    global SCRAPER_THREAD
+    if not GLOBAL_STATE['scraper_running']:
+        GLOBAL_STATE['scraper_running'] = True
+        GLOBAL_STATE['stop_scraper'] = False
+        
+        log_message("Test script starting...", level="info")
+        
+        SCRAPER_THREAD = threading.Thread(target=run_test_script_task, daemon=True)
+        SCRAPER_THREAD.start()
+        return jsonify({"success": True, "message": "Test script started."})
+    return jsonify({"success": False, "message": "Scraper already running."})
+
 @app.route('/db-view')
 def db_view():
-    """Serves the database viewer HTML."""
+    """Enhanced database viewer showing actual data with pagination (50 per page)"""
     db_path = GLOBAL_STATE['db_path']
     if not os.path.exists(db_path):
         return "Database file not found. Run the scraper to create it.", 404
 
-    html = """
-    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>DB Viewer</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-               background-color: #121212; color: #E0E0E0; margin: 0; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; background-color: #1E1E1E; border: 1px solid #333;
-                     border-radius: 8px; padding: 25px; }
-        h1 { color: #FFFFFF; border-bottom: 2px solid #444; padding-bottom: 10px; margin-top: 0; }
-        h2 { color: #E0E0E0; border-bottom: 1px solid #333; padding-bottom: 8px; margin-top: 30px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { border: 1px solid #333; padding: 10px; text-align: left; }
-        th { background-color: #2a2a2a; color: #FFFFFF; }
-        tr:nth-child(even) { background-color: #2a2a2a; }
-        nav { margin-bottom: 20px; }
-        nav a { color: #3498db; text-decoration: none; padding: 5px 10px; border-radius: 4px; }
-        nav a:hover { background-color: #333; }
-        nav a.active { font-weight: bold; background-color: #2a2a2a; }
-    </style>
-    </head><body><div class="container">
-    <h1>Database Viewer</h1>
-    <nav><a href="/">Dashboard</a> | <a href="/db-view" class="active">DB Viewer</a></nav>
-    """
+    page = request.args.get('page', 1, type=int)
+    show_type = request.args.get('type', None, type=str)
+    per_page = 50
+
+    try:
+        db = Database(db_path)
+        shows, total = db.get_shows_paginated(page, per_page, show_type)
+        total_pages = (total + per_page - 1) // per_page
+        
+        rows_html = ""
+        for show in shows:
+            rows_html += f"""
+            <tr>
+                <td>{show['id']}</td>
+                <td>{show['title']}</td>
+                <td><span style="background-color: {'#28a745' if show['type'] == 'anime' else '#3498db' if show['type'] == 'series' else '#e74c3c'}; padding: 3px 8px; border-radius: 3px; color: white; font-size: 12px;">{show['type'].upper()}</span></td>
+                <td>{show['imdb_rating'] or 'N/A'}</td>
+                <td>{show['year'] or 'N/A'}</td>
+                <td><a href="{show['source_url']}" target="_blank" style="color: #3498db;">View</a></td>
+            </tr>
+            """
+        
+        pagination_html = ""
+        if total_pages > 1:
+            pagination_html = '<div style="margin-top: 20px; text-align: center;">'
+            # Show first, previous, next, last
+            if page > 1:
+                type_param = f"&type={show_type}" if show_type else ""
+                pagination_html += f'<a href="/db-view?page=1{type_param}" style="color: #3498db; padding: 5px 10px; margin: 0 2px; border-radius: 4px;">« First</a>'
+                pagination_html += f'<a href="/db-view?page={page-1}{type_param}" style="color: #3498db; padding: 5px 10px; margin: 0 2px; border-radius: 4px;">‹ Prev</a>'
+            
+            # Show page numbers (max 10 visible)
+            start_page = max(1, page - 5)
+            end_page = min(total_pages, page + 5)
+            
+            for p in range(start_page, end_page + 1):
+                active = "style='font-weight: bold; background-color: #2a2a2a;'" if p == page else ""
+                type_param = f"&type={show_type}" if show_type else ""
+                pagination_html += f'<a href="/db-view?page={p}{type_param}" {active} style="color: #3498db; padding: 5px 10px; margin: 0 2px; border-radius: 4px;">{p}</a>'
+            
+            if page < total_pages:
+                type_param = f"&type={show_type}" if show_type else ""
+                pagination_html += f'<a href="/db-view?page={page+1}{type_param}" style="color: #3498db; padding: 5px 10px; margin: 0 2px; border-radius: 4px;">Next ›</a>'
+                pagination_html += f'<a href="/db-view?page={total_pages}{type_param}" style="color: #3498db; padding: 5px 10px; margin: 0 2px; border-radius: 4px;">Last »</a>'
+            
+            pagination_html += '</div>'
+
+        type_filter = ""
+        if show_type:
+            type_filter = f'<p>Filtering by type: <strong>{show_type.upper()}</strong> | <a href="/db-view" style="color: #3498db;">Clear Filter</a></p>'
+        else:
+            type_filter = '<p>Filter by type: <a href="/db-view?type=anime" style="color: #3498db;">Anime</a> | <a href="/db-view?type=series" style="color: #3498db;">Series</a> | <a href="/db-view?type=movie" style="color: #3498db;">Movies</a></p>'
+
+        html = f"""
+        <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>DB Viewer</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                   background-color: #121212; color: #E0E0E0; margin: 0; padding: 20px; }}
+            .container {{ max-width: 1400px; margin: 0 auto; background-color: #1E1E1E; border: 1px solid #333;
+                         border-radius: 8px; padding: 25px; }}
+            h1 {{ color: #FFFFFF; border-bottom: 2px solid #444; padding-bottom: 10px; margin-top: 0; }}
+            h2 {{ color: #E0E0E0; border-bottom: 1px solid #333; padding-bottom: 8px; margin-top: 30px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }}
+            th, td {{ border: 1px solid #333; padding: 12px; text-align: left; }}
+            th {{ background-color: #2a2a2a; color: #FFFFFF; }}
+            tr:nth-child(even) {{ background-color: #2a2a2a; }}
+            tr:hover {{ background-color: #333; }}
+            nav {{ margin-bottom: 20px; }}
+            nav a {{ color: #3498db; text-decoration: none; padding: 5px 10px; border-radius: 4px; }}
+            nav a:hover {{ background-color: #333; }}
+            nav a.active {{ font-weight: bold; background-color: #2a2a2a; }}
+            .download-btn {{ background-color: #28a745; color: white; padding: 10px 20px; border-radius: 5px; text-decoration: none; display: inline-block; margin-bottom: 20px; }}
+            .download-btn:hover {{ background-color: #218838; }}
+            .info {{ color: #AAA; font-size: 14px; margin-top: 10px; }}
+        </style>
+        </head><body><div class="container">
+        <h1>Database Viewer</h1>
+        <nav>
+            <a href="/">Dashboard</a> | <a href="/db-view" class="active">DB Viewer</a> | <a href="/stats">Stats</a>
+        </nav>
+        <a href="/download-db" class="download-btn">📥 Download Database</a>
+        <h2>Shows Data (Total: {total}, Page {page} of {total_pages})</h2>
+        {type_filter}
+        <table>
+            <tr><th>ID</th><th>Title</th><th>Type</th><th>Rating</th><th>Year</th><th>Link</th></tr>
+            {rows_html}
+        </table>
+        {pagination_html}
+        <div class="info">Showing {len(shows)} of {total} records | {per_page} per page</div>
+        </div></body></html>
+        """
+        return Response(html, mimetype='text/html')
+    except Exception as e:
+        return f"<h2>Error loading database</h2><p>{e}</p>", 500
+
+@app.route('/stats')
+def stats_page():
+    """Enhanced stats page with detailed metrics"""
+    db_path = GLOBAL_STATE['db_path']
+    if not os.path.exists(db_path):
+        return "Database file not found.", 404
 
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        # Get table names
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-        tables = [row['name'] for row in cursor.fetchall()]
+        # Get counts by type
+        cursor.execute("SELECT type, COUNT(*) as count FROM shows GROUP BY type")
+        type_counts = {row['type']: row['count'] for row in cursor.fetchall()}
         
-        table_counts = {}
-        for table in tables:
-            try:
-                cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
-                table_counts[table] = cursor.fetchone()['count']
-            except sqlite3.Error:
-                table_counts[table] = "N/A"
-
-        html += "<h2>Table Counts</h2><table><tr><th>Table Name</th><th>Row Count</th></tr>"
-        for table, count in table_counts.items():
-            html += f"<tr><td>{table}</td><td>{count}</td></tr>"
-        html += "</table>"
-
-        html += "<h2>Table Schemas</h2>"
-        for table in tables:
-            html += f"<h3>Schema: <code>{table}</code></h3>"
-            cursor.execute(f"PRAGMA table_info({table});")
-            schema = cursor.fetchall()
-            html += "<table><tr><th>Column</th><th>Type</th><th>Not Null</th><th>Default</th><th>PK</th></tr>"
-            for col in schema:
-                html += f"<tr><td>{col['name']}</td><td>{col['type']}</td><td>{col['notnull']}</td><td>{col['dflt_value']}</td><td>{col['pk']}</td></tr>"
-            html += "</table>"
-
+        # Get total episodes
+        cursor.execute("SELECT COUNT(*) as count FROM episodes")
+        total_episodes = cursor.fetchone()['count']
+        
+        # Get total servers
+        cursor.execute("SELECT COUNT(*) as count FROM servers")
+        total_servers = cursor.fetchone()['count']
+        
+        # Get average rating
+        cursor.execute("SELECT AVG(imdb_rating) as avg_rating FROM shows WHERE imdb_rating IS NOT NULL")
+        avg_rating = cursor.fetchone()['avg_rating'] or 0
+        
+        # Get shows with trailers
+        cursor.execute("SELECT COUNT(*) as count FROM shows WHERE trailer IS NOT NULL")
+        shows_with_trailers = cursor.fetchone()['count']
+        
+        # Get total shows
+        cursor.execute("SELECT COUNT(*) as count FROM shows")
+        total_shows = cursor.fetchone()['count']
+        
         conn.close()
+        
+        anime_count = type_counts.get('anime', 0)
+        series_count = type_counts.get('series', 0)
+        movie_count = type_counts.get('movie', 0)
+        
+        html = f"""
+        <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Stats</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                   background-color: #121212; color: #E0E0E0; margin: 0; padding: 20px; }}
+            .container {{ max-width: 1200px; margin: 0 auto; background-color: #1E1E1E; border: 1px solid #333;
+                         border-radius: 8px; padding: 20px; }}
+            h1 {{ color: #FFFFFF; border-bottom: 2px solid #444; padding-bottom: 10px; margin-top: 0; }}
+            h2 {{ color: #E0E0E0; border-bottom: 1px solid #333; padding-bottom: 8px; margin-top: 30px; }}
+            .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-top: 20px; }}
+            .stat-card {{ background-color: #2a2a2a; border: 1px solid #333; border-radius: 8px; padding: 20px; }}
+            .stat-card h3 {{ margin: 0 0 10px 0; color: #FFFFFF; font-size: 14px; text-transform: uppercase; }}
+            .stat-card .value {{ font-size: 32px; font-weight: bold; color: #28a745; }}
+            nav {{ margin-bottom: 20px; }}
+            nav a {{ color: #3498db; text-decoration: none; padding: 5px 10px; border-radius: 4px; }}
+            nav a:hover {{ background-color: #333; }}
+            nav a.active {{ font-weight: bold; background-color: #2a2a2a; }}
+        </style>
+        </head><body><div class="container">
+        <h1>Database Statistics</h1>
+        <nav>
+            <a href="/">Dashboard</a> | <a href="/db-view">DB Viewer</a> | <a href="/stats" class="active">Stats</a>
+        </nav>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Total Shows</h3>
+                <div class="value">{total_shows}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Anime</h3>
+                <div class="value">{anime_count}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Series</h3>
+                <div class="value">{series_count}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Movies</h3>
+                <div class="value">{movie_count}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Total Episodes</h3>
+                <div class="value">{total_episodes}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Total Servers</h3>
+                <div class="value">{total_servers}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Avg Rating</h3>
+                <div class="value">{avg_rating:.1f}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Shows with Trailers</h3>
+                <div class="value">{shows_with_trailers}</div>
+            </div>
+        </div>
+        </div></body></html>
+        """
+        return Response(html, mimetype='text/html')
     except Exception as e:
-        html += f"<h2>Error loading database</h2><p>{e}</p>"
+        return f"<h2>Error loading stats</h2><p>{e}</p>", 500
 
-    html += "</div></body></html>"
-    return Response(html, mimetype='text/html')
+@app.route('/download-db')
+def download_db():
+    """Download database file"""
+    db_path = GLOBAL_STATE['db_path']
+    if not os.path.exists(db_path):
+        return "Database file not found.", 404
+    
+    try:
+        return send_file(db_path, as_attachment=True, download_name='scraper.db')
+    except Exception as e:
+        return f"Error downloading database: {e}", 500
 
 @app.route('/api/status')
 def api_status():
-    """Returns the current global state as JSON."""
     return jsonify(GLOBAL_STATE)
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
-    """Starts the scraper thread."""
     global SCRAPER_THREAD
     if not GLOBAL_STATE['scraper_running']:
         GLOBAL_STATE['scraper_running'] = True
         GLOBAL_STATE['stop_scraper'] = False
         
-        # Reset stats
         GLOBAL_STATE['stats'] = {
             "total_sources": 0, "total_pending": 0, "completed": 0, "failed": 0,
-            "series": 0, "movies": 0, "current_file": "N/A", "failed_urls": []
+            "series": 0, "movies": 0, "anime": 0, "current_file": "N/A", "failed_urls": []
         }
         
         log_message("Scraper starting...", level="info")
         
-        # Pre-calculate totals
         try:
             db = Database(GLOBAL_STATE['db_path'])
             all_urls_map = db.get_all_urls_from_files(GLOBAL_STATE['json_files'])
-            db.get_pending_urls(all_urls_map) # This updates GLOBAL_STATE['stats']['total_pending']
+            db.get_pending_urls(all_urls_map)
         except Exception as e:
             log_message(f"Error pre-calculating totals: {e}", level="error")
 
@@ -1116,7 +1527,6 @@ def api_start():
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
-    """Signals the scraper thread to stop."""
     if GLOBAL_STATE['scraper_running']:
         GLOBAL_STATE['stop_scraper'] = True
         log_message("Stop signal sent. Waiting for current task to finish...", level="warning")
@@ -1126,28 +1536,19 @@ def api_stop():
 # --- Main Execution ---
 
 if __name__ == "__main__":
-    # Ensure data directory exists
     os.makedirs("data", exist_ok=True)
     
-    # Check for source JSON files
     for f in GLOBAL_STATE['json_files']:
         if not os.path.exists(f):
-            print(f"WARNING: Source file not found: {f}. Scraper may not find items.")
-            # Create empty files if they don't exist, as per user's repo structure
-            if not os.path.exists(f):
-                try:
-                    with open(f, 'w') as new_file:
-                        json.dump({"urls": []}, new_file)
-                    print(f"Created empty file: {f}")
-                except Exception as e:
-                    print(f"Could not create file {f}: {e}")
+            try:
+                with open(f, 'w') as new_file:
+                    json.dump({"urls": []}, new_file)
+            except Exception as e:
+                print(f"Could not create file {f}: {e}")
 
-    # Initialize the database schema
     init_database(GLOBAL_STATE['db_path'])
     
-    # Print the requested message
     print("DASHBOARD OPEN !")
     print(f"Access at: http://127.0.0.1:8080")
     
-    # Run the Flask app
     app.run(host='0.0.0.0', port=8080, debug=False)
