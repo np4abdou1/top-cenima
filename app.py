@@ -2130,91 +2130,767 @@ MAIN_PAGE_TEMPLATE = """
 </html>
 """
 
-# DB Explorer base page template
+# DB Explorer base page template - Enhanced Show Browser
 DB_PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DB Explorer</title>
+    <title>SHOW-BROWSER v1.0</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap');
-        :root { --bg-color: #0a0e14; --terminal-bg: #0f1419; --border-color: #00ff41; --text-color: #00ff41; --text-dim: #00aa33; }
-        body { font-family: 'Share Tech Mono', monospace; background: var(--bg-color); color: var(--text-color); }
+        
+        :root {
+            --bg-color: #0a0e14;
+            --terminal-bg: #0f1419;
+            --border-color: #00ff41;
+            --text-color: #00ff41;
+            --text-dim: #00aa33;
+            --accent-color: #00ffff;
+            --success-color: #00ff41;
+            --warn-color: #ffaa00;
+            --glow: 0 0 10px #00ff41, 0 0 20px #00ff41;
+        }
+
+        body.theme-blue {
+            --border-color: #00ffff;
+            --text-color: #00ffff;
+            --text-dim: #00aaaa;
+            --accent-color: #00ff41;
+            --glow: 0 0 10px #00ffff, 0 0 20px #00ffff;
+        }
+
+        body.theme-amber {
+            --border-color: #ffc400;
+            --text-color: #ffc400;
+            --text-dim: #b38a00;
+            --accent-color: #00ffff;
+            --glow: 0 0 10px #ffc400, 0 0 20px #ffc400;
+        }
+        
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        body {
+            font-family: 'Share Tech Mono', monospace;
+            background: var(--bg-color);
+            color: var(--text-color);
+            overflow-x: hidden;
+            background-image: 
+                repeating-linear-gradient(0deg, rgba(0,255,65,0.03) 0px, transparent 1px, transparent 2px, rgba(0,255,65,0.03) 3px),
+                repeating-linear-gradient(90deg, rgba(0,255,65,0.03) 0px, transparent 1px, transparent 2px, rgba(0,255,65,0.03) 3px);
+            transition: all 0.3s;
+        }
+
+        body.theme-blue { background-image: repeating-linear-gradient(0deg, rgba(0,255,255,0.03) 0px, transparent 1px, transparent 2px, rgba(0,255,255,0.03) 3px), repeating-linear-gradient(90deg, rgba(0,255,255,0.03) 0px, transparent 1px, transparent 2px, rgba(0,255,255,0.03) 3px); }
+        body.theme-amber { background-image: repeating-linear-gradient(0deg, rgba(255,196,0,0.03) 0px, transparent 1px, transparent 2px, rgba(255,196,0,0.03) 3px), repeating-linear-gradient(90deg, rgba(255,196,0,0.03) 0px, transparent 1px, transparent 2px, rgba(255,196,0,0.03) 3px); }
+        
+        .scanline {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(to bottom, transparent 50%, rgba(0,255,65,0.02) 51%);
+            background-size: 100% 4px; pointer-events: none; z-index: 9999;
+            animation: scanline 8s linear infinite;
+        }
+        @keyframes scanline { 0% { background-position: 0 0; } 100% { background-position: 0 100%; } }
+        
         .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-        header { border: 2px solid var(--border-color); padding: 20px; margin-bottom: 20px; background: var(--terminal-bg); }
-        h1 { font-family: 'VT323', monospace; font-size: 32px; letter-spacing: 2px; }
-        .table-list { list-style: none; padding: 0; }
-        .table-list li { margin: 10px 0; }
-        .table-list a { color: var(--text-color); font-size: 18px; text-decoration: none; padding: 8px; border: 1px solid var(--text-dim); border-radius: 8px; transition: all 0.2s; }
-        .table-list a:hover { background: var(--border-color); color: var(--terminal-bg); border-color: var(--border-color); }
+        
+        header {
+            border: 2px solid var(--border-color); padding: 20px; margin-bottom: 20px;
+            background: var(--terminal-bg); box-shadow: var(--glow);
+            animation: flicker 0.15s infinite alternate; transition: all 0.3s;
+        }
+        @keyframes flicker { 0%, 100% { opacity: 1; } 50% { opacity: 0.97; } }
+        
+        .terminal-header {
+            display: flex; justify-content: space-between; align-items: center;
+            flex-wrap: wrap; gap: 10px; margin-bottom: 15px;
+        }
+        
+        h1 {
+            font-family: 'VT323', monospace; font-size: 32px; letter-spacing: 2px;
+            text-shadow: var(--glow); animation: glitch 3s infinite; transition: text-shadow 0.3s;
+        }
+        @keyframes glitch {
+            0%, 90%, 100% { text-shadow: var(--glow); }
+            92% { text-shadow: 2px 0 0 #ff0055, -2px 0 0 var(--accent-color); }
+            94% { text-shadow: -2px 0 0 #ff0055, 2px 0 0 var(--accent-color); }
+        }
+
+        .header-utils {
+            display: flex; align-items: center; gap: 15px;
+        }
+
+        .theme-selector {
+            display: flex; gap: 5px; border: 1px solid var(--text-dim);
+            border-radius: 8px; padding: 5px;
+        }
+        .theme-selector span {
+            padding: 5px 8px; cursor: pointer; border-radius: 5px;
+            transition: all 0.2s; font-size: 12px;
+        }
+        .theme-selector span:hover { background: var(--text-dim); color: var(--terminal-bg); }
+        .theme-selector span.active { background: var(--border-color); color: var(--terminal-bg); font-weight: bold; }
+
+        .header-utils a {
+            font-size: 14px; padding: 8px 12px; border: 1px solid var(--border-color);
+            background: var(--terminal-bg); color: var(--text-color); text-decoration: none;
+            border-radius: 8px; transition: all 0.2s;
+        }
+        .header-utils a:hover { background: var(--border-color); color: var(--terminal-bg); box-shadow: 0 0 15px var(--border-color); }
+        
+        .controls {
+            display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;
+        }
+        
+        .controls input[type="text"] {
+            flex: 1; min-width: 200px; background: var(--terminal-bg);
+            border: 2px solid var(--border-color); color: var(--text-color);
+            padding: 12px 20px; font-family: 'Share Tech Mono', monospace;
+            font-size: 14px; border-radius: 8px; transition: all 0.3s;
+        }
+        .controls input[type="text"]::placeholder { color: var(--text-dim); }
+        .controls input[type="text"]:focus { outline: none; box-shadow: var(--glow); }
+        
+        .controls button {
+            font-family: 'Share Tech Mono', monospace; font-size: 14px;
+            padding: 12px 20px; border: 2px solid var(--border-color);
+            background: var(--terminal-bg); color: var(--text-color);
+            cursor: pointer; transition: all 0.2s; text-transform: uppercase;
+            letter-spacing: 1px; border-radius: 8px;
+        }
+        .controls button:hover { box-shadow: 0 0 15px var(--border-color); transform: translateY(-2px); }
+        .controls button.active { background: var(--border-color); color: var(--terminal-bg); font-weight: bold; }
+        
+        .stats-bar {
+            display: flex; justify-content: space-around; gap: 10px;
+            padding: 15px; border: 1px solid var(--text-dim);
+            background: rgba(0,0,0,0.3); margin-bottom: 20px; border-radius: 8px;
+        }
+        .stat-item { text-align: center; }
+        .stat-item strong {
+            display: block; font-size: 24px; font-family: 'VT323', monospace;
+            color: var(--accent-color); text-shadow: 0 0 10px currentColor;
+        }
+        .stat-item span { font-size: 11px; text-transform: uppercase; color: var(--text-dim); }
+        
+        .shows-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 20px; margin-top: 20px;
+        }
+        
+        .show-card {
+            border: 2px solid var(--text-dim); background: var(--terminal-bg);
+            padding: 0; cursor: pointer; transition: all 0.3s;
+            position: relative; overflow: hidden; border-radius: 8px;
+        }
+        .show-card:hover {
+            border-color: var(--border-color); transform: translateY(-5px);
+            box-shadow: 0 0 20px var(--border-color);
+        }
+        
+        .show-card .poster {
+            width: 100%; height: 280px; object-fit: cover;
+            background: var(--terminal-bg); border-bottom: 2px solid var(--text-dim);
+        }
+        .show-card .poster-placeholder {
+            width: 100%; height: 280px; display: flex; align-items: center;
+            justify-content: center; background: var(--terminal-bg);
+            border-bottom: 2px solid var(--text-dim); font-size: 48px;
+            color: var(--text-dim);
+        }
+        
+        .show-card .info {
+            padding: 15px;
+        }
+        .show-card .title {
+            font-size: 16px; font-weight: bold; margin-bottom: 8px;
+            color: var(--border-color); white-space: nowrap; overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .show-card .meta {
+            font-size: 12px; color: var(--text-dim); margin-bottom: 5px;
+        }
+        .show-card .rating {
+            display: inline-block; padding: 4px 8px; background: var(--border-color);
+            color: var(--terminal-bg); font-size: 12px; font-weight: bold;
+            border-radius: 4px; margin-top: 5px;
+        }
+        .show-card .type-badge {
+            position: absolute; top: 10px; right: 10px;
+            padding: 4px 8px; background: var(--border-color);
+            color: var(--terminal-bg); font-size: 10px; font-weight: bold;
+            text-transform: uppercase; border-radius: 4px;
+        }
+        
+        .empty-state {
+            text-align: center; padding: 60px 20px; border: 2px dashed var(--text-dim);
+            background: rgba(0,0,0,0.2); margin-top: 40px; border-radius: 8px;
+        }
+        .empty-state h2 {
+            font-family: 'VT323', monospace; font-size: 36px;
+            color: var(--text-dim); margin-bottom: 15px;
+        }
+        .empty-state p { color: var(--text-dim); font-size: 14px; }
     </style>
 </head>
-<body>
+<body class="theme-green">
+    <div class="scanline"></div>
     <div class="container">
         <header>
-            <h1>🗂️ DB Explorer</h1>
+            <div class="terminal-header">
+                <h1>█ SHOW-BROWSER v1.0 █</h1>
+                <div class="header-utils">
+                    <div class="theme-selector">
+                        <span id="theme-green" class="active" onclick="setTheme('theme-green')">Green</span>
+                        <span id="theme-blue" onclick="setTheme('theme-blue')">Blue</span>
+                        <span id="theme-amber" onclick="setTheme('theme-amber')">Amber</span>
+                    </div>
+                    <a href="/">← Scraper</a>
+                </div>
+            </div>
+            <div class="controls">
+                <input type="text" id="search-input" placeholder="Search shows by title...">
+                <button id="filter-all" class="active" onclick="filterType('all')">ALL</button>
+                <button id="filter-movies" onclick="filterType('movie')">MOVIES</button>
+                <button id="filter-series" onclick="filterType('series')">SERIES</button>
+                <button id="filter-anime" onclick="filterType('anime')">ANIME</button>
+            </div>
         </header>
-        <h2>Tables:</h2>
-        <ul class="table-list">
-            {% for table in tables %}
-            <li><a href="/db/{{ table }}">{{ table }}</a></li>
-            {% endfor %}
-        </ul>
+
+        <div class="stats-bar" id="stats-bar">
+            <div class="stat-item">
+                <strong id="total-count">0</strong>
+                <span>TOTAL</span>
+            </div>
+            <div class="stat-item">
+                <strong id="movies-count">0</strong>
+                <span>MOVIES</span>
+            </div>
+            <div class="stat-item">
+                <strong id="series-count">0</strong>
+                <span>SERIES</span>
+            </div>
+            <div class="stat-item">
+                <strong id="anime-count">0</strong>
+                <span>ANIME</span>
+            </div>
+        </div>
+
+        <div class="shows-grid" id="shows-grid">
+            <div class="empty-state">
+                <h2>LOADING...</h2>
+                <p>Fetching shows from database...</p>
+            </div>
+        </div>
     </div>
+
+    <script>
+        let allShows = [];
+        let currentFilter = 'all';
+        
+        function setTheme(themeName) {
+            document.body.className = themeName;
+            localStorage.setItem('scraperTheme', themeName);
+            document.querySelectorAll('.theme-selector span').forEach(span => {
+                span.classList.remove('active');
+            });
+            document.getElementById(themeName).classList.add('active');
+        }
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            const savedTheme = localStorage.getItem('scraperTheme') || 'theme-green';
+            setTheme(savedTheme);
+            loadShows();
+        });
+        
+        const searchInput = document.getElementById('search-input');
+        searchInput.addEventListener('input', () => {
+            filterShows();
+        });
+        
+        function filterType(type) {
+            currentFilter = type;
+            document.querySelectorAll('.controls button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            // Map type to button ID
+            const buttonMap = {
+                'all': 'filter-all',
+                'movie': 'filter-movies',
+                'series': 'filter-series',
+                'anime': 'filter-anime'
+            };
+            const buttonId = buttonMap[type] || `filter-${type}`;
+            const button = document.getElementById(buttonId);
+            if (button) button.classList.add('active');
+            filterShows();
+        }
+        
+        async function loadShows() {
+            try {
+                const response = await fetch('/api/shows');
+                const data = await response.json();
+                allShows = data.shows || [];
+                updateStats();
+                filterShows();
+            } catch (e) {
+                console.error('Failed to load shows:', e);
+                document.getElementById('shows-grid').innerHTML = `
+                    <div class="empty-state">
+                        <h2>ERROR</h2>
+                        <p>Failed to load shows from database.</p>
+                    </div>
+                `;
+            }
+        }
+        
+        function updateStats() {
+            const counts = {
+                total: allShows.length,
+                movies: allShows.filter(s => s.type === 'movie').length,
+                series: allShows.filter(s => s.type === 'series').length,
+                anime: allShows.filter(s => s.type === 'anime').length
+            };
+            document.getElementById('total-count').textContent = counts.total;
+            document.getElementById('movies-count').textContent = counts.movies;
+            document.getElementById('series-count').textContent = counts.series;
+            document.getElementById('anime-count').textContent = counts.anime;
+        }
+        
+        function filterShows() {
+            const searchTerm = searchInput.value.toLowerCase();
+            let filtered = allShows;
+            
+            if (currentFilter !== 'all') {
+                filtered = filtered.filter(s => s.type === currentFilter);
+            }
+            
+            if (searchTerm) {
+                filtered = filtered.filter(s => s.title.toLowerCase().includes(searchTerm));
+            }
+            
+            renderShows(filtered);
+        }
+        
+        function renderShows(shows) {
+            const grid = document.getElementById('shows-grid');
+            
+            if (shows.length === 0) {
+                grid.innerHTML = `
+                    <div class="empty-state">
+                        <h2>NO SHOWS FOUND</h2>
+                        <p>Try adjusting your search or filter criteria.</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            grid.innerHTML = shows.map(show => `
+                <div class="show-card" onclick="viewShow(${show.id})">
+                    <div class="type-badge">${show.type}</div>
+                    ${show.poster ? 
+                        `<img class="poster" src="${show.poster}" alt="${show.title}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                         <div class="poster-placeholder" style="display:none;">📺</div>` :
+                        `<div class="poster-placeholder">📺</div>`
+                    }
+                    <div class="info">
+                        <div class="title">${show.title}</div>
+                        <div class="meta">${show.year || 'N/A'} • ${show.genres || 'Unknown'}</div>
+                        ${show.imdb_rating ? `<span class="rating">⭐ ${show.imdb_rating}</span>` : ''}
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        function viewShow(id) {
+            window.location.href = `/db/show/${id}`;
+        }
+    </script>
 </body>
 </html>
 """
 
-# DB Explorer table view template
-DB_TABLE_TEMPLATE = """
+# Show Details Page Template
+SHOW_DETAILS_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DB Explorer: {{ table_name }}</title>
+    <title>{{ show.title }} - SHOW-BROWSER</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap');
-        :root { --bg-color: #0a0e14; --terminal-bg: #0f1419; --border-color: #00ff41; --text-color: #00ff41; --text-dim: #00aa33; }
-        body { font-family: 'Share Tech Mono', monospace; background: var(--bg-color); color: var(--text-color); }
-        .container { max-width: 95%; margin: 0 auto; padding: 20px; }
-        header { border: 2px solid var(--border-color); padding: 20px; margin-bottom: 20px; background: var(--terminal-bg); }
-        h1 { font-family: 'VT323', monospace; font-size: 32px; letter-spacing: 2px; }
-        a { color: var(--border-color); }
-        table { border-collapse: collapse; width: 100%; margin-top: 20px; border: 1px solid var(--text-dim); }
-        th, td { border: 1px solid var(--text-dim); padding: 10px; text-align: left; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        th { background: var(--terminal-bg); color: var(--border-color); font-size: 14px; }
-        td { font-size: 12px; }
-        tr:nth-child(even) { background: var(--terminal-bg); }
+        
+        :root {
+            --bg-color: #0a0e14; --terminal-bg: #0f1419; --border-color: #00ff41;
+            --text-color: #00ff41; --text-dim: #00aa33; --accent-color: #00ffff;
+            --success-color: #00ff41; --warn-color: #ffaa00;
+            --glow: 0 0 10px #00ff41, 0 0 20px #00ff41;
+        }
+        body.theme-blue { --border-color: #00ffff; --text-color: #00ffff; --text-dim: #00aaaa; --accent-color: #00ff41; --glow: 0 0 10px #00ffff, 0 0 20px #00ffff; }
+        body.theme-amber { --border-color: #ffc400; --text-color: #ffc400; --text-dim: #b38a00; --accent-color: #00ffff; --glow: 0 0 10px #ffc400, 0 0 20px #ffc400; }
+        
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Share Tech Mono', monospace; background: var(--bg-color); color: var(--text-color);
+            background-image: repeating-linear-gradient(0deg, rgba(0,255,65,0.03) 0px, transparent 1px, transparent 2px, rgba(0,255,65,0.03) 3px), repeating-linear-gradient(90deg, rgba(0,255,65,0.03) 0px, transparent 1px, transparent 2px, rgba(0,255,65,0.03) 3px);
+            transition: all 0.3s;
+        }
+        body.theme-blue { background-image: repeating-linear-gradient(0deg, rgba(0,255,255,0.03) 0px, transparent 1px, transparent 2px, rgba(0,255,255,0.03) 3px), repeating-linear-gradient(90deg, rgba(0,255,255,0.03) 0px, transparent 1px, transparent 2px, rgba(0,255,255,0.03) 3px); }
+        body.theme-amber { background-image: repeating-linear-gradient(0deg, rgba(255,196,0,0.03) 0px, transparent 1px, transparent 2px, rgba(255,196,0,0.03) 3px), repeating-linear-gradient(90deg, rgba(255,196,0,0.03) 0px, transparent 1px, transparent 2px, rgba(255,196,0,0.03) 3px); }
+        
+        .scanline { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: linear-gradient(to bottom, transparent 50%, rgba(0,255,65,0.02) 51%); background-size: 100% 4px; pointer-events: none; z-index: 9999; animation: scanline 8s linear infinite; }
+        @keyframes scanline { 0% { background-position: 0 0; } 100% { background-position: 0 100%; } }
+        
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        
+        header {
+            border: 2px solid var(--border-color); padding: 20px; margin-bottom: 20px;
+            background: var(--terminal-bg); box-shadow: var(--glow); transition: all 0.3s;
+        }
+        
+        .terminal-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+        
+        h1 {
+            font-family: 'VT323', monospace; font-size: 28px; letter-spacing: 2px;
+            text-shadow: var(--glow); transition: text-shadow 0.3s;
+        }
+
+        .header-utils { display: flex; align-items: center; gap: 15px; }
+        .theme-selector { display: flex; gap: 5px; border: 1px solid var(--text-dim); border-radius: 8px; padding: 5px; }
+        .theme-selector span { padding: 5px 8px; cursor: pointer; border-radius: 5px; transition: all 0.2s; font-size: 12px; }
+        .theme-selector span:hover { background: var(--text-dim); color: var(--terminal-bg); }
+        .theme-selector span.active { background: var(--border-color); color: var(--terminal-bg); font-weight: bold; }
+        .header-utils a { font-size: 14px; padding: 8px 12px; border: 1px solid var(--border-color); background: var(--terminal-bg); color: var(--text-color); text-decoration: none; border-radius: 8px; transition: all 0.2s; }
+        .header-utils a:hover { background: var(--border-color); color: var(--terminal-bg); box-shadow: 0 0 15px var(--border-color); }
+        
+        .show-details {
+            display: grid; grid-template-columns: 300px 1fr; gap: 30px; margin-bottom: 30px;
+        }
+        @media (max-width: 768px) { .show-details { grid-template-columns: 1fr; } }
+        
+        .poster-section {
+            border: 2px solid var(--border-color); background: var(--terminal-bg); padding: 0; border-radius: 8px; overflow: hidden;
+        }
+        .poster-section img, .poster-placeholder {
+            width: 100%; height: 420px; object-fit: cover; display: block;
+        }
+        .poster-placeholder {
+            display: flex; align-items: center; justify-content: center;
+            background: var(--terminal-bg); font-size: 80px; color: var(--text-dim);
+        }
+        
+        .info-section {
+            border: 2px solid var(--border-color); background: var(--terminal-bg);
+            padding: 25px; border-radius: 8px;
+        }
+        .info-section h2 {
+            font-family: 'VT323', monospace; font-size: 36px;
+            color: var(--border-color); margin-bottom: 15px; text-shadow: var(--glow);
+        }
+        .type-badge {
+            display: inline-block; padding: 6px 12px; background: var(--border-color);
+            color: var(--terminal-bg); font-size: 12px; font-weight: bold;
+            text-transform: uppercase; border-radius: 4px; margin-bottom: 15px;
+        }
+        .meta-row {
+            display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap;
+        }
+        .meta-item strong { color: var(--accent-color); margin-right: 5px; }
+        .rating {
+            display: inline-flex; align-items: center; gap: 5px;
+            padding: 6px 12px; background: var(--warn-color); color: var(--terminal-bg);
+            font-weight: bold; border-radius: 4px; font-size: 16px;
+        }
+        .synopsis {
+            margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--text-dim);
+            line-height: 1.8; color: var(--text-color);
+        }
+        .metadata {
+            margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--text-dim);
+        }
+        .metadata-item { margin-bottom: 10px; }
+        .metadata-item strong { color: var(--accent-color); margin-right: 10px; }
+        
+        .trailer-section {
+            margin-bottom: 30px; border: 2px solid var(--border-color);
+            background: var(--terminal-bg); padding: 20px; border-radius: 8px;
+        }
+        .trailer-section h3 {
+            font-family: 'VT323', monospace; font-size: 24px;
+            color: var(--border-color); margin-bottom: 15px;
+        }
+        .trailer-section iframe {
+            width: 100%; height: 500px; border: 1px solid var(--text-dim);
+            border-radius: 4px;
+        }
+        
+        .seasons-section {
+            border: 2px solid var(--border-color); background: var(--terminal-bg);
+            padding: 20px; border-radius: 8px; margin-bottom: 30px;
+        }
+        .seasons-section h3 {
+            font-family: 'VT323', monospace; font-size: 24px;
+            color: var(--border-color); margin-bottom: 15px;
+        }
+        .season-list { display: flex; gap: 10px; flex-wrap: wrap; }
+        .season-btn {
+            padding: 10px 20px; border: 2px solid var(--text-dim);
+            background: var(--terminal-bg); color: var(--text-color);
+            cursor: pointer; transition: all 0.2s; border-radius: 8px;
+            font-family: 'Share Tech Mono', monospace;
+        }
+        .season-btn:hover, .season-btn.active {
+            border-color: var(--border-color); background: var(--border-color);
+            color: var(--terminal-bg); box-shadow: 0 0 15px var(--border-color);
+        }
+        
+        .episodes-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 15px; margin-top: 20px;
+        }
+        .episode-card {
+            border: 2px solid var(--text-dim); background: rgba(0,0,0,0.3);
+            padding: 15px; text-align: center; cursor: pointer;
+            transition: all 0.2s; border-radius: 8px;
+        }
+        .episode-card:hover {
+            border-color: var(--border-color); transform: translateY(-2px);
+            box-shadow: 0 0 10px var(--border-color);
+        }
+        .episode-card .ep-num {
+            font-family: 'VT323', monospace; font-size: 28px;
+            color: var(--accent-color); margin-bottom: 5px;
+        }
+        .episode-card .ep-label { font-size: 11px; color: var(--text-dim); }
+        
+        .servers-section {
+            border: 2px solid var(--border-color); background: var(--terminal-bg);
+            padding: 20px; border-radius: 8px; margin-top: 20px;
+        }
+        .servers-section h3 {
+            font-family: 'VT323', monospace; font-size: 24px;
+            color: var(--border-color); margin-bottom: 15px;
+        }
+        .server-list { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+        .server-btn {
+            padding: 10px 20px; border: 2px solid var(--text-dim);
+            background: var(--terminal-bg); color: var(--text-color);
+            cursor: pointer; transition: all 0.2s; border-radius: 8px;
+            font-family: 'Share Tech Mono', monospace;
+        }
+        .server-btn:hover, .server-btn.active {
+            border-color: var(--accent-color); background: var(--accent-color);
+            color: var(--terminal-bg); box-shadow: 0 0 15px var(--accent-color);
+        }
+        .server-player {
+            width: 100%; height: 500px; border: 1px solid var(--text-dim);
+            border-radius: 4px; background: #000;
+        }
+        
+        .empty-state {
+            text-align: center; padding: 40px; color: var(--text-dim);
+            border: 1px dashed var(--text-dim); background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+        }
     </style>
 </head>
-<body>
+<body class="theme-green">
+    <div class="scanline"></div>
     <div class="container">
         <header>
-            <h1>🗂️ DB Explorer: {{ table_name }}</h1>
-            <a href="/db">&larr; Back to Tables</a>
+            <div class="terminal-header">
+                <h1>█ {{ show.title }} █</h1>
+                <div class="header-utils">
+                    <div class="theme-selector">
+                        <span id="theme-green" class="active" onclick="setTheme('theme-green')">Green</span>
+                        <span id="theme-blue" onclick="setTheme('theme-blue')">Blue</span>
+                        <span id="theme-amber" onclick="setTheme('theme-amber')">Amber</span>
+                    </div>
+                    <a href="/db">← Browse Shows</a>
+                </div>
+            </div>
         </header>
-        <table>
-            <thead>
-                <tr>
-                    {% for header in headers %}
-                    <th>{{ header }}</th>
-                    {% endfor %}
-                </tr>
-            </thead>
-            <tbody>
-                {% for row in rows %}
-                <tr>
-                    {% for header in headers %}
-                    <td>{{ row[header] }}</td>
-                    {% endfor %}
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+
+        <div class="show-details">
+            <div class="poster-section">
+                {% if show.poster %}
+                    <img src="{{ show.poster }}" alt="{{ show.title }}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                    <div class="poster-placeholder" style="display:none;">📺</div>
+                {% else %}
+                    <div class="poster-placeholder">📺</div>
+                {% endif %}
+            </div>
+            
+            <div class="info-section">
+                <h2>{{ show.title }}</h2>
+                <span class="type-badge">{{ show.type }}</span>
+                
+                <div class="meta-row">
+                    {% if show.year %}<div class="meta-item"><strong>Year:</strong> {{ show.year }}</div>{% endif %}
+                    {% if show.imdb_rating %}<span class="rating">⭐ {{ show.imdb_rating }}</span>{% endif %}
+                </div>
+                
+                {% if show.synopsis %}
+                <div class="synopsis">
+                    <strong style="color: var(--accent-color);">Synopsis:</strong><br>
+                    {{ show.synopsis }}
+                </div>
+                {% endif %}
+                
+                <div class="metadata">
+                    {% if show.genres %}<div class="metadata-item"><strong>Genres:</strong> {{ show.genres }}</div>{% endif %}
+                    {% if show.cast %}<div class="metadata-item"><strong>Cast:</strong> {{ show.cast }}</div>{% endif %}
+                    {% if show.directors %}<div class="metadata-item"><strong>Directors:</strong> {{ show.directors }}</div>{% endif %}
+                    {% if show.country %}<div class="metadata-item"><strong>Country:</strong> {{ show.country }}</div>{% endif %}
+                    {% if show.language %}<div class="metadata-item"><strong>Language:</strong> {{ show.language }}</div>{% endif %}
+                    {% if show.duration %}<div class="metadata-item"><strong>Duration:</strong> {{ show.duration }}</div>{% endif %}
+                </div>
+            </div>
+        </div>
+
+        {% if show.trailer %}
+        <div class="trailer-section">
+            <h3>▸ TRAILER</h3>
+            <iframe src="{{ show.trailer }}" allowfullscreen></iframe>
+        </div>
+        {% endif %}
+
+        {% if show.type in ['series', 'anime'] and seasons %}
+        <div class="seasons-section">
+            <h3>▸ SEASONS & EPISODES</h3>
+            <div class="season-list" id="season-list"></div>
+            <div class="episodes-grid" id="episodes-grid"></div>
+        </div>
+        {% endif %}
+
+        <div class="servers-section" id="servers-section" style="display: none;">
+            <h3>▸ WATCH SERVERS</h3>
+            <div class="server-list" id="server-list"></div>
+            <iframe class="server-player" id="server-player"></iframe>
+        </div>
     </div>
+
+    <script>
+        const showData = {{ show | tojson }};
+        const seasonsData = {{ seasons | tojson }};
+        let currentSeasonId = null;
+        let currentEpisodeId = null;
+        let currentMovieId = {% if show.type == 'movie' %}{{ show.id }}{% else %}null{% endif %};
+        
+        function setTheme(themeName) {
+            document.body.className = themeName;
+            localStorage.setItem('scraperTheme', themeName);
+            document.querySelectorAll('.theme-selector span').forEach(span => {
+                span.classList.remove('active');
+            });
+            document.getElementById(themeName).classList.add('active');
+        }
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            const savedTheme = localStorage.getItem('scraperTheme') || 'theme-green';
+            setTheme(savedTheme);
+            
+            if (showData.type === 'movie') {
+                loadMovieServers();
+            } else if (seasonsData && seasonsData.length > 0) {
+                renderSeasons();
+                selectSeason(seasonsData[0].id);
+            }
+        });
+        
+        function renderSeasons() {
+            const seasonList = document.getElementById('season-list');
+            seasonList.innerHTML = seasonsData.map(season => `
+                <button class="season-btn" onclick="selectSeason(${season.id})" id="season-btn-${season.id}">
+                    SEASON ${season.season_number}
+                </button>
+            `).join('');
+        }
+        
+        async function selectSeason(seasonId) {
+            currentSeasonId = seasonId;
+            document.querySelectorAll('.season-btn').forEach(btn => btn.classList.remove('active'));
+            document.getElementById(`season-btn-${seasonId}`).classList.add('active');
+            
+            try {
+                const response = await fetch(`/api/episodes/${seasonId}`);
+                const data = await response.json();
+                renderEpisodes(data.episodes || []);
+            } catch (e) {
+                console.error('Failed to load episodes:', e);
+            }
+        }
+        
+        function renderEpisodes(episodes) {
+            const grid = document.getElementById('episodes-grid');
+            
+            if (episodes.length === 0) {
+                grid.innerHTML = '<div class="empty-state">No episodes found for this season.</div>';
+                return;
+            }
+            
+            grid.innerHTML = episodes.map(ep => `
+                <div class="episode-card" onclick="selectEpisode(${ep.id})">
+                    <div class="ep-num">${ep.episode_number}</div>
+                    <div class="ep-label">EPISODE</div>
+                </div>
+            `).join('');
+        }
+        
+        async function selectEpisode(episodeId) {
+            currentEpisodeId = episodeId;
+            try {
+                const response = await fetch(`/api/servers/episode/${episodeId}`);
+                const data = await response.json();
+                showServers(data.servers || []);
+            } catch (e) {
+                console.error('Failed to load servers:', e);
+            }
+        }
+        
+        async function loadMovieServers() {
+            try {
+                const response = await fetch(`/api/servers/movie/${currentMovieId}`);
+                const data = await response.json();
+                showServers(data.servers || []);
+            } catch (e) {
+                console.error('Failed to load servers:', e);
+            }
+        }
+        
+        function showServers(servers) {
+            const section = document.getElementById('servers-section');
+            const serverList = document.getElementById('server-list');
+            const player = document.getElementById('server-player');
+            
+            if (servers.length === 0) {
+                section.style.display = 'none';
+                return;
+            }
+            
+            section.style.display = 'block';
+            serverList.innerHTML = servers.map(server => `
+                <button class="server-btn" onclick="playServer('${server.embed_url}', ${server.server_number})" id="server-btn-${server.server_number}">
+                    SERVER ${server.server_number}
+                </button>
+            `).join('');
+            
+            // Auto-play first server
+            if (servers.length > 0) {
+                playServer(servers[0].embed_url, servers[0].server_number);
+            }
+        }
+        
+        function playServer(embedUrl, serverNumber) {
+            const player = document.getElementById('server-player');
+            player.src = embedUrl;
+            
+            document.querySelectorAll('.server-btn').forEach(btn => btn.classList.remove('active'));
+            document.getElementById(`server-btn-${serverNumber}`).classList.add('active');
+        }
+    </script>
 </body>
 </html>
 """
@@ -2333,23 +3009,132 @@ def download_db():
 # --- NEW: DB Explorer Routes ---
 @app.route('/db')
 def db_explorer():
-    """Displays a list of all tables in the database."""
-    db = Database(DB_PATH)
-    if not db.conn:
-        return "Error: Could not connect to database.", 500
-    tables = db.get_table_names()
-    db.close()
-    return render_template_string(DB_PAGE_TEMPLATE, tables=tables)
+    """Show browser main page - displays all shows in a grid."""
+    return render_template_string(DB_PAGE_TEMPLATE)
 
-@app.route('/db/<table>')
-def db_view_table(table):
-    """Displays the data for a specific table."""
+@app.route('/db/show/<int:show_id>')
+def db_view_show(show_id):
+    """Show details page with seasons, episodes, and servers."""
     db = Database(DB_PATH)
     if not db.conn:
         return "Error: Could not connect to database.", 500
-    headers, rows = db.get_table_data(table)
-    db.close()
-    return render_template_string(DB_TABLE_TEMPLATE, table_name=table, headers=headers, rows=rows)
+    
+    cursor = db.conn.cursor()
+    try:
+        # Get show details
+        cursor.execute("SELECT * FROM shows WHERE id = ?", (show_id,))
+        show_row = cursor.fetchone()
+        
+        if not show_row:
+            db.close()
+            return "Show not found.", 404
+        
+        show = dict(show_row)
+        
+        # Get seasons if it's a series or anime
+        seasons = []
+        if show['type'] in ['series', 'anime']:
+            cursor.execute("SELECT * FROM seasons WHERE show_id = ? ORDER BY season_number", (show_id,))
+            seasons = [dict(row) for row in cursor.fetchall()]
+        
+        db.close()
+        return render_template_string(SHOW_DETAILS_TEMPLATE, show=show, seasons=seasons)
+    except Exception as e:
+        db.close()
+        return f"Error: {e}", 500
+
+# --- API Endpoints for Show Browser ---
+
+@app.route('/api/shows')
+def api_get_shows():
+    """API endpoint to get all shows for the browser."""
+    db = Database(DB_PATH)
+    if not db.conn:
+        return jsonify({"error": "Database connection failed"}), 500
+    
+    cursor = db.conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT id, title, type, poster, year, imdb_rating, genres 
+            FROM shows 
+            ORDER BY created_at DESC
+        """)
+        shows = [dict(row) for row in cursor.fetchall()]
+        db.close()
+        return jsonify({"shows": shows})
+    except Exception as e:
+        db.close()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/shows/<int:show_id>')
+def api_get_show(show_id):
+    """API endpoint to get a specific show's details."""
+    db = Database(DB_PATH)
+    if not db.conn:
+        return jsonify({"error": "Database connection failed"}), 500
+    
+    cursor = db.conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM shows WHERE id = ?", (show_id,))
+        show_row = cursor.fetchone()
+        
+        if not show_row:
+            db.close()
+            return jsonify({"error": "Show not found"}), 404
+        
+        show = dict(show_row)
+        db.close()
+        return jsonify({"show": show})
+    except Exception as e:
+        db.close()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/episodes/<int:season_id>')
+def api_get_episodes(season_id):
+    """API endpoint to get all episodes for a season."""
+    db = Database(DB_PATH)
+    if not db.conn:
+        return jsonify({"error": "Database connection failed"}), 500
+    
+    cursor = db.conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT id, episode_number 
+            FROM episodes 
+            WHERE season_id = ? 
+            ORDER BY CAST(episode_number AS REAL)
+        """, (season_id,))
+        episodes = [dict(row) for row in cursor.fetchall()]
+        db.close()
+        return jsonify({"episodes": episodes})
+    except Exception as e:
+        db.close()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/servers/<parent_type>/<int:parent_id>')
+def api_get_servers(parent_type, parent_id):
+    """API endpoint to get servers for a movie or episode."""
+    if parent_type not in ['movie', 'episode']:
+        return jsonify({"error": "Invalid parent type"}), 400
+    
+    db = Database(DB_PATH)
+    if not db.conn:
+        return jsonify({"error": "Database connection failed"}), 500
+    
+    cursor = db.conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT embed_url, server_number 
+            FROM servers 
+            WHERE parent_type = ? AND parent_id = ? 
+            ORDER BY server_number
+        """, (parent_type, parent_id))
+        servers = [dict(row) for row in cursor.fetchall()]
+        db.close()
+        return jsonify({"servers": servers})
+    except Exception as e:
+        db.close()
+        return jsonify({"error": str(e)}), 500
 
 # --- Main Execution ---
 
