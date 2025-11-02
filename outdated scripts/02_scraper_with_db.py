@@ -1,15 +1,19 @@
 """
-Enhanced TopCinema scraper that saves to SQLite database with resumable progress
+Enhanced TopCinema scraper with web dashboard, retry logic, and improved error handling
+Features: Single-line progress, web status server on port 8080, failed URLs export
 """
 import json
 import os
 import re
 import time
 import sqlite3
+import sys
 from typing import List, Dict, Optional
 from urllib.parse import unquote, urlparse, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import logging
 
 import requests
@@ -20,8 +24,24 @@ from rich.text import Text
 from rich.table import Table
 
 console = Console()
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
+requests.packages.urllib3.disable_warnings()
+
+# Global stats for web dashboard
+STATS = {
+    'current_file': '',
+    'current_url': '',
+    'total_urls': 0,
+    'completed': 0,
+    'failed': 0,
+    'success': 0,
+    'start_time': time.time(),
+    'failed_urls': [],
+    'current_show': '',
+    'episodes_found': 0,
+    'servers_found': 0
+}
 
 class Database:
     def __init__(self, db_path: str = "data/scraper.db"):
@@ -230,6 +250,68 @@ class Database:
             cursor.execute("INSERT OR IGNORE INTO scrape_progress (url, status) VALUES (?, 'pending')", (url,))
         conn.commit()
         conn.close()
+
+class StatusHandler(BaseHTTPRequestHandler):
+    """Web dashboard handler"""
+    def log_message(self, format, *args):
+        pass  # Suppress server logs
+    
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Refresh', '2')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        
+        elapsed = time.time() - STATS['start_time']
+        hours, minutes, seconds = int(elapsed // 3600), int((elapsed % 3600) // 60), int(elapsed % 60)
+        progress_pct = (STATS['completed'] / STATS['total_urls'] * 100) if STATS['total_urls'] > 0 else 0
+        success_rate = (STATS['success'] / STATS['completed'] * 100) if STATS['completed'] > 0 else 0
+        
+        html = f"""<!DOCTYPE html><html><head><title>Scraper Status</title><style>
+body{{font-family:Arial;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;padding:20px;margin:0}}
+.container{{max-width:1200px;margin:0 auto;background:rgba(255,255,255,0.1);backdrop-filter:blur(10px);border-radius:20px;padding:30px;box-shadow:0 8px 32px 0 rgba(31,38,135,0.37)}}
+h1{{text-align:center;margin-bottom:30px;font-size:2.5em;text-shadow:2px 2px 4px rgba(0,0,0,0.3)}}
+.stats-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-bottom:30px}}
+.stat-card{{background:rgba(255,255,255,0.2);padding:20px;border-radius:15px;text-align:center}}
+.stat-value{{font-size:2.5em;font-weight:bold;margin:10px 0}}
+.stat-label{{font-size:0.9em;opacity:0.9}}
+.progress-bar{{width:100%;height:40px;background:rgba(255,255,255,0.2);border-radius:20px;overflow:hidden;margin:20px 0}}
+.progress-fill{{height:100%;background:linear-gradient(90deg,#00d2ff 0%,#3a47d5 100%);transition:width 0.3s ease;display:flex;align-items:center;justify-content:center;font-weight:bold}}
+.current-info{{background:rgba(255,255,255,0.15);padding:20px;border-radius:15px;margin-top:20px}}
+.current-info h3{{margin-top:0;border-bottom:2px solid rgba(255,255,255,0.3);padding-bottom:10px}}
+.info-row{{margin:10px 0;padding:8px;background:rgba(0,0,0,0.2);border-radius:8px}}
+.failed-list{{max-height:200px;overflow-y:auto;background:rgba(0,0,0,0.2);padding:15px;border-radius:10px;margin-top:10px}}
+.failed-item{{padding:5px;margin:5px 0;background:rgba(255,0,0,0.2);border-left:3px solid #f44;border-radius:5px;font-size:0.9em}}
+.success{{color:#4ade80}}.error{{color:#f87171}}
+</style></head><body><div class="container">
+<h1>🎬 TopCinema Scraper Dashboard</h1>
+<div class="stats-grid">
+<div class="stat-card"><div class="stat-label">Total URLs</div><div class="stat-value">{STATS['total_urls']}</div></div>
+<div class="stat-card"><div class="stat-label">Completed</div><div class="stat-value success">{STATS['completed']}</div></div>
+<div class="stat-card"><div class="stat-label">Success</div><div class="stat-value success">{STATS['success']}</div></div>
+<div class="stat-card"><div class="stat-label">Failed</div><div class="stat-value error">{STATS['failed']}</div></div>
+<div class="stat-card"><div class="stat-label">Success Rate</div><div class="stat-value">{success_rate:.1f}%</div></div>
+<div class="stat-card"><div class="stat-label">Elapsed Time</div><div class="stat-value">{hours:02d}:{minutes:02d}:{seconds:02d}</div></div>
+</div>
+<div class="progress-bar"><div class="progress-fill" style="width:{progress_pct}%">{progress_pct:.1f}%</div></div>
+<div class="current-info">
+<h3>📂 Current File</h3><div class="info-row">{STATS['current_file']}</div>
+<h3>🔗 Current URL</h3><div class="info-row" style="word-break:break-all;font-size:0.85em">{STATS['current_url']}</div>
+<h3>🎭 Current Show</h3><div class="info-row">{STATS['current_show']}</div>
+<div class="info-row">📺 Episodes: {STATS['episodes_found']} | 🖥️ Servers: {STATS['servers_found']}</div>
+</div>
+{f'<div class="current-info"><h3 class="error">❌ Failed URLs ({len(STATS["failed_urls"])})</h3><div class="failed-list">{"".join([f"<div class=\\'failed-item\\'>{url}</div>" for url in STATS["failed_urls"][-20:]])}</div></div>' if STATS['failed_urls'] else ''}
+</div></body></html>"""
+        
+        self.wfile.write(html.encode('utf-8'))
+
+def start_web_server():
+    """Start web server in background"""
+    server = HTTPServer(('0.0.0.0', 8080), StatusHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 db = Database()
 
@@ -576,13 +658,14 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
     
     return episodes
 
-def scrape_series(url: str) -> Optional[Dict]:
+def scrape_series(url: str, force_type: str = "series") -> Optional[Dict]:
     """Scrape series"""
     soup = fetch_html(url)
     if not soup:
         return None
     
-    details = extract_media_details(soup, "series")
+    details = extract_media_details(soup, force_type)
+    STATS['current_show'] = details.get('title', 'Unknown')
 
     seasons: List[Dict] = []
     season_urls: Dict[int, str] = {}
@@ -653,10 +736,19 @@ def scrape_series(url: str) -> Optional[Dict]:
             "episodes": []
         })
 
+    # Scrape episodes and track stats
+    total_episodes = 0
+    total_servers = 0
     for season in seasons:
         s_num = season["season_number"]
         if s_num in season_urls:
             season["episodes"] = scrape_season_episodes(season_urls[s_num])
+            total_episodes += len(season["episodes"])
+            for ep in season["episodes"]:
+                total_servers += len(ep.get("servers", []))
+    
+    STATS['episodes_found'] = total_episodes
+    STATS['servers_found'] = total_servers
 
     episode_page_url = None
     if seasons:
@@ -679,12 +771,13 @@ def scrape_series(url: str) -> Optional[Dict]:
 
     return {
         "title": details["title"],
-        "type": "series",
+        "type": force_type,
         "imdb_rating": details["imdb_rating"],
         "poster": details["poster"],
         "synopsis": details["synopsis"],
         "metadata": details["metadata"],
         "trailer": trailer_url,
+        "year": None,
         "source_url": url,
         "seasons": seasons
     }
@@ -817,14 +910,14 @@ def extract_media_details(soup: BeautifulSoup, media_type: str) -> Dict:
     
     return details
 
-def run_single(url_input: str) -> Optional[Dict]:
+def run_single(url_input: str, force_type: str = None) -> Optional[Dict]:
     """Main scraping function"""
     url = url_input.strip()
     
     if REGEX_PATTERNS['movie'].search(url):
         return scrape_movie(url)
     else:
-        return scrape_series(url)
+        return scrape_series(url, force_type=force_type or "series")
 
 def cleanup():
     """Cleanup resources before exit"""
@@ -835,49 +928,58 @@ def cleanup():
         logger.warning(f"Cleanup error: {e}")
 
 if __name__ == "__main__":
-    import sys
+    # Get local IP
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except:
+        local_ip = "localhost"
     
-    # Process both JSON files in order
+    # Clear screen and show minimal output
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(f"WORKING° check {local_ip}:8080")
+    sys.stdout.flush()
+    
+    # Start web dashboard
+    server = start_web_server()
+    
+    # Process both JSON files
     json_files = [
-        "data/series_animes.json",
-        "data/movies.json"
+        ("data/series_animes.json", "series"),
+        ("data/movies.json", "movie")
     ]
     
-    total_success = 0
-    total_errors = 0
-    overall_start = time.time()
+    STATS['start_time'] = time.time()
     
-    for json_file in json_files:
+    # Count total URLs first
+    for json_file, _ in json_files:
+        if os.path.exists(json_file):
+            urls = db.get_pending_urls(json_file)
+            STATS['total_urls'] += len(urls)
+    
+    # Process each file
+    for json_file, force_type in json_files:
         if not os.path.exists(json_file):
-            console.print(f"[yellow]Warning: {json_file} not found, skipping...[/yellow]")
             continue
         
-        console.print(f"\n[bold magenta]{'='*60}[/bold magenta]")
-        console.print(f"[bold magenta]Processing: {json_file}[/bold magenta]")
-        console.print(f"[bold magenta]{'='*60}[/bold magenta]\n")
-        
-        # Get pending URLs (skip already completed)
+        STATS['current_file'] = json_file
         urls = db.get_pending_urls(json_file)
         
         if not urls:
-            console.print(f"[green]✓ All URLs from {json_file} already scraped![/green]")
             continue
         
-        console.print(f"[bold blue]Found {len(urls)} pending URLs to scrape[/bold blue]")
-        
-        # Initialize progress tracking
         db.init_progress(urls)
         
-        # Scrape each URL
-        start_time = time.time()
-        success_count = 0
-        error_count = 0
-        
+        # Process each URL (silently)
         for idx, url in enumerate(urls, 1):
-            console.print(f"\n[bold cyan][{idx}/{len(urls)}] Scraping: {url}[/bold cyan]")
+            STATS['current_url'] = url
             
             try:
-                result = run_single(url)
+                result = run_single(url, force_type=force_type)
+                
                 if result:
                     show_id = db.insert_show(result)
                     if show_id:
@@ -887,45 +989,37 @@ if __name__ == "__main__":
                             db.insert_movie_servers(show_id, result.get("streaming_servers", []))
                         
                         db.mark_progress(url, "completed", show_id)
-                        success_count += 1
-                        total_success += 1
-                        console.print(f"[green]✓ Saved to database[/green]")
+                        STATS['success'] += 1
                     else:
-                        db.mark_progress(url, "failed", error="Duplicate show")
-                        error_count += 1
-                        total_errors += 1
+                        db.mark_progress(url, "failed", error="Duplicate")
+                        STATS['failed'] += 1
+                        STATS['failed_urls'].append(url)
                 else:
-                    db.mark_progress(url, "failed", error="Scraping returned no data")
-                    error_count += 1
-                    total_errors += 1
-                    console.print(f"[red]✗ Failed to scrape[/red]")
+                    db.mark_progress(url, "failed", error="No data")
+                    STATS['failed'] += 1
+                    STATS['failed_urls'].append(url)
             except Exception as e:
-                db.mark_progress(url, "failed", error=str(e))
-                error_count += 1
-                total_errors += 1
-                console.print(f"[red]✗ Error: {str(e)[:100]}[/red]")
-        
-        elapsed = time.time() - start_time
-        minutes = int(elapsed // 60)
-        seconds = int(elapsed % 60)
-        time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-        
-        console.print(f"\n[bold]{json_file} Summary:[/bold]")
-        console.print(f"[green]✓ Completed: {success_count}[/green]")
-        console.print(f"[red]✗ Failed: {error_count}[/red]")
-        console.print(f"[cyan]⏱ Time: {time_str}[/cyan]")
+                db.mark_progress(url, "failed", error=str(e)[:100])
+                STATS['failed'] += 1
+                STATS['failed_urls'].append(url)
+            
+            STATS['completed'] += 1
     
-    # Overall summary
-    total_elapsed = time.time() - overall_start
-    total_minutes = int(total_elapsed // 60)
-    total_seconds = int(total_elapsed % 60)
-    total_time_str = f"{total_minutes}m {total_seconds}s" if total_minutes > 0 else f"{total_seconds}s"
-    
-    console.print(f"\n[bold magenta]{'='*60}[/bold magenta]")
-    console.print(f"[bold magenta]OVERALL SUMMARY[/bold magenta]")
-    console.print(f"[bold magenta]{'='*60}[/bold magenta]")
-    console.print(f"[green]✓ Total Completed: {total_success}[/green]")
-    console.print(f"[red]✗ Total Failed: {total_errors}[/red]")
-    console.print(f"[cyan]⏱ Total Time: {total_time_str}[/cyan]")
+    # Export failed URLs (silently)
+    if STATS['failed_urls']:
+        failed_file = f"data/failed_urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(failed_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                'failed_count': len(STATS['failed_urls']),
+                'timestamp': datetime.now().isoformat(),
+                'urls': STATS['failed_urls']
+            }, f, indent=2, ensure_ascii=False)
     
     cleanup()
+    
+    # Keep server running (silently)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        server.shutdown()

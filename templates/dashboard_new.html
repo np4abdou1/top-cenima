@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TopCinema Scraper</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0e27;
+            color: #e2e8f0;
+            font-size: 13px;
+        }
+        
+        .container { max-width: 1400px; margin: 0 auto; padding: 15px; }
+        
+        header {
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        h1 { font-size: 20px; font-weight: 600; color: #60a5fa; }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .stat-card {
+            background: #1e293b;
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid #334155;
+            transition: all 0.2s;
+        }
+        
+        .stat-card:hover { border-color: #60a5fa; }
+        
+        .stat-label {
+            font-size: 11px;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+        
+        .stat-value {
+            font-size: 22px;
+            font-weight: 700;
+            color: #f1f5f9;
+        }
+        
+        .stat-sub {
+            font-size: 10px;
+            color: #64748b;
+            margin-top: 2px;
+        }
+        
+        .progress-section {
+            background: #1e293b;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            border: 1px solid #334155;
+        }
+        
+        .progress-bar-wrap {
+            width: 100%;
+            height: 24px;
+            background: #0f172a;
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+        }
+        
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6 0%, #60a5fa 100%);
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        
+        .progress-info {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 11px;
+            color: #94a3b8;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #334155;
+            padding-bottom: 8px;
+        }
+        
+        .tab {
+            padding: 6px 16px;
+            background: transparent;
+            border: none;
+            color: #94a3b8;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        
+        .tab:hover { background: #1e293b; color: #e2e8f0; }
+        .tab.active { background: #3b82f6; color: #fff; }
+        
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        .card {
+            background: #1e293b;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            border: 1px solid #334155;
+        }
+        
+        .card h3 {
+            font-size: 14px;
+            margin-bottom: 12px;
+            color: #f1f5f9;
+            font-weight: 600;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        
+        th, td {
+            padding: 8px;
+            text-align: left;
+            border-bottom: 1px solid #334155;
+        }
+        
+        th {
+            background: #0f172a;
+            font-weight: 600;
+            color: #94a3b8;
+            font-size: 11px;
+            text-transform: uppercase;
+        }
+        
+        tr:hover { background: #0f172a; }
+        
+        .search-box {
+            width: 100%;
+            padding: 10px 14px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            color: #e2e8f0;
+            font-size: 13px;
+            margin-bottom: 12px;
+        }
+        
+        .search-box:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+        }
+        
+        .badge-success { background: #10b981; color: #fff; }
+        .badge-error { background: #ef4444; color: #fff; }
+        .badge-info { background: #3b82f6; color: #fff; }
+        
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #334155;
+            font-size: 12px;
+        }
+        
+        .info-row:last-child { border-bottom: none; }
+        .info-label { color: #94a3b8; }
+        .info-value { color: #f1f5f9; font-weight: 500; }
+        
+        .pagination {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            margin: 15px 0;
+        }
+        
+        .pagination button {
+            padding: 6px 12px;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            color: #e2e8f0;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .pagination button:hover:not(:disabled) {
+            background: #334155;
+        }
+        
+        .pagination button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 30px;
+            color: #64748b;
+        }
+        
+        .genre-tag {
+            display: inline-block;
+            padding: 3px 8px;
+            background: #334155;
+            border-radius: 4px;
+            margin: 2px;
+            font-size: 11px;
+        }
+        
+        .db-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .db-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎬 TopCinema Scraper</h1>
+            <div style="font-size: 11px; color: #64748b;">Real-time Dashboard</div>
+        </header>
+
+        <!-- Main Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total URLs</div>
+                <div class="stat-value" id="total-urls">0</div>
+                <div class="stat-sub">Combined</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Completed</div>
+                <div class="stat-value" id="completed">0</div>
+                <div class="stat-sub" id="speed">0/min</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Success</div>
+                <div class="stat-value" id="success" style="color: #10b981;">0</div>
+                <div class="stat-sub" id="success-rate">0%</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Failed</div>
+                <div class="stat-value" id="failed" style="color: #ef4444;">0</div>
+                <div class="stat-sub">Exported</div>
+            </div>
+        </div>
+
+        <!-- Progress -->
+        <div class="progress-section">
+            <div class="progress-bar-wrap">
+                <div class="progress-bar" id="progress-bar" style="width: 0%">
+                    <span id="progress-text">0%</span>
+                </div>
+            </div>
+            <div class="progress-info">
+                <span>⏱️ <strong id="elapsed">00:00:00</strong></span>
+                <span>🚀 <strong id="speed2">0</strong>/min</span>
+                <span>⏳ ETA: <strong id="eta">00:00:00</strong></span>
+            </div>
+        </div>
+
+        <!-- Current Activity -->
+        <div class="card">
+            <h3>Current Activity</h3>
+            <div class="info-row">
+                <span class="info-label">File</span>
+                <span class="info-value" id="current-file">-</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Show</span>
+                <span class="info-value" id="current-show">-</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Episodes</span>
+                <span class="info-value" id="episodes-found">0</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Servers</span>
+                <span class="info-value" id="servers-found">0</span>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('database')">Database</button>
+            <button class="tab" onclick="switchTab('shows')">Browse</button>
+            <button class="tab" onclick="switchTab('failed')">Failed</button>
+        </div>
+
+        <!-- Database Tab -->
+        <div id="database-tab" class="tab-content active">
+            <div class="db-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Shows</div>
+                    <div class="stat-value" id="db-total-shows">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Movies</div>
+                    <div class="stat-value" id="db-movies">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Series</div>
+                    <div class="stat-value" id="db-series">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Episodes</div>
+                    <div class="stat-value" id="db-episodes">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Servers</div>
+                    <div class="stat-value" id="db-servers">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Avg Rating</div>
+                    <div class="stat-value" id="db-avg-rating">0</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Top Rated Shows</h3>
+                <div id="top-rated-list"></div>
+            </div>
+        </div>
+
+        <!-- Shows Browser Tab -->
+        <div id="shows-tab" class="tab-content">
+            <div class="card">
+                <input type="text" class="search-box" id="search-input" placeholder="Search shows...">
+                <div id="shows-list"></div>
+                <div class="pagination" id="pagination"></div>
+            </div>
+        </div>
+
+        <!-- Failed URLs Tab -->
+        <div id="failed-tab" class="tab-content">
+            <div class="card">
+                <h3>Failed URLs</h3>
+                <div id="failed-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        let currentPage = 1;
+
+        socket.on('stats_update', (data) => {
+            // Update without flashing
+            requestAnimationFrame(() => {
+                document.getElementById('total-urls').textContent = data.total_urls.toLocaleString();
+                document.getElementById('completed').textContent = data.completed.toLocaleString();
+                document.getElementById('success').textContent = data.success.toLocaleString();
+                document.getElementById('failed').textContent = data.failed.toLocaleString();
+                document.getElementById('speed').textContent = `${data.current_speed}/min`;
+                document.getElementById('speed2').textContent = data.current_speed;
+                document.getElementById('success-rate').textContent = `${data.success_rate}%`;
+                document.getElementById('elapsed').textContent = data.elapsed;
+                document.getElementById('eta').textContent = data.eta;
+                
+                document.getElementById('current-file').textContent = data.current_file || '-';
+                document.getElementById('current-show').textContent = data.current_show || '-';
+                document.getElementById('episodes-found').textContent = data.episodes_found.toLocaleString();
+                document.getElementById('servers-found').textContent = data.servers_found.toLocaleString();
+                
+                const progressBar = document.getElementById('progress-bar');
+                progressBar.style.width = data.progress_pct + '%';
+                document.getElementById('progress-text').textContent = data.progress_pct.toFixed(1) + '%';
+            });
+        });
+
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            event.target.classList.add('active');
+            document.getElementById(tab + '-tab').classList.add('active');
+            
+            if (tab === 'database') loadDatabaseStats();
+            if (tab === 'shows') loadShows();
+            if (tab === 'failed') loadFailedUrls();
+        }
+
+        async function loadDatabaseStats() {
+            const response = await fetch('/api/database/stats');
+            const data = await response.json();
+            
+            document.getElementById('db-total-shows').textContent = data.total_shows.toLocaleString();
+            document.getElementById('db-movies').textContent = data.movies.toLocaleString();
+            document.getElementById('db-series').textContent = data.series.toLocaleString();
+            document.getElementById('db-episodes').textContent = data.episodes.toLocaleString();
+            document.getElementById('db-servers').textContent = data.servers.toLocaleString();
+            document.getElementById('db-avg-rating').textContent = data.avg_rating;
+            
+            const topRatedHtml = data.top_rated.map(show => `
+                <div class="info-row">
+                    <span>${show.title.substring(0, 30)}</span>
+                    <span class="badge badge-success">${show.imdb_rating}/10</span>
+                </div>
+            `).join('');
+            document.getElementById('top-rated-list').innerHTML = topRatedHtml;
+        }
+
+        async function loadShows(page = 1) {
+            const search = document.getElementById('search-input').value;
+            const response = await fetch(`/api/database/shows?page=${page}&per_page=30&search=${search}`);
+            const data = await response.json();
+            
+            const showsHtml = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Title</th>
+                            <th>Type</th>
+                            <th>Year</th>
+                            <th>Rating</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${data.shows.map(show => `
+                            <tr>
+                                <td>${show.id}</td>
+                                <td>${show.title.substring(0, 40)}</td>
+                                <td><span class="badge badge-info">${show.type}</span></td>
+                                <td>${show.year || '-'}</td>
+                                <td>${show.imdb_rating || '-'}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+            
+            document.getElementById('shows-list').innerHTML = showsHtml;
+            
+            const paginationHtml = `
+                <button onclick="loadShows(${page - 1})" ${page === 1 ? 'disabled' : ''}>←</button>
+                <span style="padding: 6px 12px;">Page ${page} of ${data.total_pages}</span>
+                <button onclick="loadShows(${page + 1})" ${page >= data.total_pages ? 'disabled' : ''}>→</button>
+            `;
+            document.getElementById('pagination').innerHTML = paginationHtml;
+        }
+
+        async function loadFailedUrls() {
+            const response = await fetch('/api/database/failed-urls');
+            const data = await response.json();
+            
+            const failedHtml = data.length > 0 ? `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>URL</th>
+                            <th>Error</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${data.map(item => `
+                            <tr>
+                                <td style="font-size: 11px;">${item.url.substring(0, 60)}...</td>
+                                <td style="font-size: 11px;">${(item.error_message || 'Unknown').substring(0, 30)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            ` : '<p class="loading">No failed URLs</p>';
+            
+            document.getElementById('failed-list').innerHTML = failedHtml;
+        }
+
+        let searchTimeout;
+        document.getElementById('search-input').addEventListener('input', () => {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => loadShows(1), 500);
+        });
+
+        loadDatabaseStats();
+        setInterval(loadDatabaseStats, 5000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TopCinema Scraper</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            text-align: center;
+            padding: 30px 0;
+            animation: fadeInDown 0.6s ease;
+        }
+
+        h1 {
+            font-size: 3em;
+            font-weight: 800;
+            text-shadow: 2px 2px 20px rgba(0,0,0,0.3);
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            font-size: 1.1em;
+            opacity: 0.9;
+            font-weight: 300;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 25px;
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            transition: all 0.3s ease;
+            animation: fadeInUp 0.6s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 40px 0 rgba(31, 38, 135, 0.5);
+        }
+
+        .stat-card {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 3em;
+            font-weight: 800;
+            margin: 15px 0;
+            background: linear-gradient(135deg, #fff 0%, #f0f0f0 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            font-size: 0.95em;
+            opacity: 0.8;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .stat-change {
+            font-size: 0.85em;
+            margin-top: 8px;
+            opacity: 0.7;
+        }
+
+        .progress-section {
+            margin: 30px 0;
+        }
+
+        .progress-bar-container {
+            width: 100%;
+            height: 50px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 25px;
+            overflow: hidden;
+            position: relative;
+            box-shadow: inset 0 2px 10px rgba(0,0,0,0.2);
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #00d2ff 0%, #3a47d5 100%);
+            transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 1.1em;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .progress-bar::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            animation: shimmer 2s infinite;
+        }
+
+        @keyframes shimmer {
+            100% { left: 100%; }
+        }
+
+        .current-info {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 20px;
+            border-radius: 15px;
+            margin: 20px 0;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .info-row:last-child {
+            border-bottom: none;
+        }
+
+        .info-label {
+            font-weight: 600;
+            opacity: 0.8;
+        }
+
+        .info-value {
+            font-weight: 500;
+            text-align: right;
+            max-width: 60%;
+            word-break: break-all;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin: 30px 0 20px;
+            flex-wrap: wrap;
+        }
+
+        .tab {
+            padding: 12px 30px;
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            border-radius: 25px;
+            color: #fff;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 0.95em;
+        }
+
+        .tab:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .tab.active {
+            background: linear-gradient(135deg, #00d2ff 0%, #3a47d5 100%);
+            box-shadow: 0 4px 15px rgba(0, 210, 255, 0.4);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.4s ease;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        th, td {
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        th {
+            background: rgba(0, 0, 0, 0.3);
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.85em;
+            letter-spacing: 1px;
+        }
+
+        tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .search-box {
+            width: 100%;
+            padding: 15px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            border-radius: 25px;
+            color: #fff;
+            font-size: 1em;
+            margin-bottom: 20px;
+            transition: all 0.3s ease;
+        }
+
+        .search-box:focus {
+            outline: none;
+            border-color: #00d2ff;
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .search-box::placeholder {
+            color: rgba(255, 255, 255, 0.5);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+
+        .badge-success { background: #10b981; }
+        .badge-error { background: #ef4444; }
+        .badge-warning { background: #f59e0b; }
+        .badge-info { background: #3b82f6; }
+
+        .chart-container {
+            position: relative;
+            height: 300px;
+            margin: 20px 0;
+        }
+
+        .pulse {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes fadeInDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .pagination {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin: 20px 0;
+        }
+
+        .pagination button {
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            border-radius: 10px;
+            color: #fff;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .pagination button:hover:not(:disabled) {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .pagination button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            font-size: 1.2em;
+            opacity: 0.7;
+        }
+
+        .spinner {
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-top: 3px solid #fff;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .genre-tag {
+            display: inline-block;
+            padding: 5px 12px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 15px;
+            margin: 3px;
+            font-size: 0.85em;
+        }
+
+        @media (max-width: 768px) {
+            h1 { font-size: 2em; }
+            .grid { grid-template-columns: 1fr; }
+            .stat-value { font-size: 2.5em; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎬 TopCinema Scraper</h1>
+            <p class="subtitle">Real-time Monitoring Dashboard</p>
+        </header>
+
+        <!-- Main Stats Grid -->
+        <div class="grid">
+            <div class="card stat-card">
+                <div class="stat-label">Total URLs</div>
+                <div class="stat-value" id="total-urls">0</div>
+                <div class="stat-change">From both JSON files</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">Completed</div>
+                <div class="stat-value" id="completed">0</div>
+                <div class="stat-change" id="speed">0 URLs/min</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">Success</div>
+                <div class="stat-value" id="success" style="color: #10b981;">0</div>
+                <div class="stat-change" id="success-rate">0% success rate</div>
+            </div>
+            <div class="card stat-card">
+                <div class="stat-label">Failed</div>
+                <div class="stat-value" id="failed" style="color: #ef4444;">0</div>
+                <div class="stat-change">Auto-exported to JSON</div>
+            </div>
+        </div>
+
+        <!-- Progress Bar -->
+        <div class="card progress-section">
+            <h3 style="margin-bottom: 15px;">Scraping Progress</h3>
+            <div class="progress-bar-container">
+                <div class="progress-bar" id="progress-bar" style="width: 0%">
+                    <span id="progress-text">0%</span>
+                </div>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-top: 15px; font-size: 0.9em; opacity: 0.8;">
+                <span>⏱️ Elapsed: <strong id="elapsed">00:00:00</strong></span>
+                <span>🚀 Speed: <strong id="speed2">0</strong> URLs/min</span>
+                <span>⏳ ETA: <strong id="eta">00:00:00</strong></span>
+            </div>
+        </div>
+
+        <!-- Current Activity -->
+        <div class="card">
+            <h3 style="margin-bottom: 15px;">📊 Current Activity</h3>
+            <div class="current-info">
+                <div class="info-row">
+                    <span class="info-label">📂 Current File</span>
+                    <span class="info-value" id="current-file">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">🔗 Current URL</span>
+                    <span class="info-value" id="current-url">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">🎭 Current Show</span>
+                    <span class="info-value" id="current-show">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">📺 Episodes Found</span>
+                    <span class="info-value" id="episodes-found">0</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">🖥️ Servers Found</span>
+                    <span class="info-value" id="servers-found">0</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('database')">📊 Database Stats</button>
+            <button class="tab" onclick="switchTab('shows')">🎬 Browse Shows</button>
+            <button class="tab" onclick="switchTab('failed')">❌ Failed URLs</button>
+            <button class="tab" onclick="switchTab('charts')">📈 Charts</button>
+        </div>
+
+        <!-- Database Stats Tab -->
+        <div id="database-tab" class="tab-content active">
+            <div class="grid">
+                <div class="card stat-card">
+                    <div class="stat-label">Total Shows</div>
+                    <div class="stat-value" id="db-total-shows">0</div>
+                </div>
+                <div class="card stat-card">
+                    <div class="stat-label">Movies</div>
+                    <div class="stat-value" id="db-movies">0</div>
+                </div>
+                <div class="card stat-card">
+                    <div class="stat-label">Series</div>
+                    <div class="stat-value" id="db-series">0</div>
+                </div>
+                <div class="card stat-card">
+                    <div class="stat-label">Episodes</div>
+                    <div class="stat-value" id="db-episodes">0</div>
+                </div>
+                <div class="card stat-card">
+                    <div class="stat-label">Servers</div>
+                    <div class="stat-value" id="db-servers">0</div>
+                </div>
+                <div class="card stat-card">
+                    <div class="stat-label">Avg Rating</div>
+                    <div class="stat-value" id="db-avg-rating">0</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3 style="margin-bottom: 15px;">🏆 Top Rated Shows</h3>
+                <div id="top-rated-list"></div>
+            </div>
+
+            <div class="card">
+                <h3 style="margin-bottom: 15px;">🎭 Top Genres</h3>
+                <div id="top-genres-list"></div>
+            </div>
+        </div>
+
+        <!-- Shows Browser Tab -->
+        <div id="shows-tab" class="tab-content">
+            <div class="card">
+                <input type="text" class="search-box" id="search-input" placeholder="🔍 Search shows by title, genre, or cast...">
+                <div id="shows-list"></div>
+                <div class="pagination" id="pagination"></div>
+            </div>
+        </div>
+
+        <!-- Failed URLs Tab -->
+        <div id="failed-tab" class="tab-content">
+            <div class="card">
+                <h3 style="margin-bottom: 15px;">❌ Failed URLs</h3>
+                <div id="failed-list"></div>
+            </div>
+        </div>
+
+        <!-- Charts Tab -->
+        <div id="charts-tab" class="tab-content">
+            <div class="grid">
+                <div class="card">
+                    <h3 style="margin-bottom: 15px;">Content Distribution</h3>
+                    <div class="chart-container">
+                        <canvas id="type-chart"></canvas>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3 style="margin-bottom: 15px;">Top Genres</h3>
+                    <div class="chart-container">
+                        <canvas id="genre-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        let currentPage = 1;
+        let typeChart, genreChart;
+
+        // Socket connection
+        socket.on('connect', () => {
+            console.log('Connected to server');
+        });
+
+        socket.on('stats_update', (data) => {
+            updateStats(data);
+        });
+
+        function updateStats(data) {
+            document.getElementById('total-urls').textContent = data.total_urls.toLocaleString();
+            document.getElementById('completed').textContent = data.completed.toLocaleString();
+            document.getElementById('success').textContent = data.success.toLocaleString();
+            document.getElementById('failed').textContent = data.failed.toLocaleString();
+            document.getElementById('speed').textContent = `${data.current_speed} URLs/min`;
+            document.getElementById('speed2').textContent = data.current_speed;
+            document.getElementById('success-rate').textContent = `${data.success_rate}% success rate`;
+            document.getElementById('elapsed').textContent = data.elapsed;
+            document.getElementById('eta').textContent = data.eta;
+            
+            document.getElementById('current-file').textContent = data.current_file || '-';
+            document.getElementById('current-url').textContent = data.current_url || '-';
+            document.getElementById('current-show').textContent = data.current_show || '-';
+            document.getElementById('episodes-found').textContent = data.episodes_found.toLocaleString();
+            document.getElementById('servers-found').textContent = data.servers_found.toLocaleString();
+            
+            const progressPct = data.progress_pct;
+            document.getElementById('progress-bar').style.width = progressPct + '%';
+            document.getElementById('progress-text').textContent = progressPct.toFixed(1) + '%';
+        }
+
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            event.target.classList.add('active');
+            document.getElementById(tab + '-tab').classList.add('active');
+            
+            if (tab === 'database') loadDatabaseStats();
+            if (tab === 'shows') loadShows();
+            if (tab === 'failed') loadFailedUrls();
+            if (tab === 'charts') loadCharts();
+        }
+
+        async function loadDatabaseStats() {
+            const response = await fetch('/api/database/stats');
+            const data = await response.json();
+            
+            document.getElementById('db-total-shows').textContent = data.total_shows.toLocaleString();
+            document.getElementById('db-movies').textContent = data.movies.toLocaleString();
+            document.getElementById('db-series').textContent = data.series.toLocaleString();
+            document.getElementById('db-episodes').textContent = data.episodes.toLocaleString();
+            document.getElementById('db-servers').textContent = data.servers.toLocaleString();
+            document.getElementById('db-avg-rating').textContent = data.avg_rating;
+            
+            // Top rated
+            const topRatedHtml = data.top_rated.map(show => `
+                <div class="info-row">
+                    <span>${show.title} (${show.year || 'N/A'})</span>
+                    <span class="badge badge-success">${show.imdb_rating}/10</span>
+                </div>
+            `).join('');
+            document.getElementById('top-rated-list').innerHTML = topRatedHtml;
+            
+            // Top genres
+            const topGenresHtml = data.top_genres.map(([genre, count]) => `
+                <span class="genre-tag">${genre} (${count})</span>
+            `).join('');
+            document.getElementById('top-genres-list').innerHTML = topGenresHtml;
+        }
+
+        async function loadShows(page = 1) {
+            const search = document.getElementById('search-input').value;
+            const response = await fetch(`/api/database/shows?page=${page}&per_page=50&search=${search}`);
+            const data = await response.json();
+            
+            const showsHtml = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Title</th>
+                            <th>Type</th>
+                            <th>Year</th>
+                            <th>Rating</th>
+                            <th>Genres</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${data.shows.map(show => `
+                            <tr onclick="viewShow(${show.id})">
+                                <td>${show.id}</td>
+                                <td>${show.title}</td>
+                                <td><span class="badge badge-info">${show.type}</span></td>
+                                <td>${show.year || 'N/A'}</td>
+                                <td>${show.imdb_rating || 'N/A'}</td>
+                                <td>${(show.genres || '').substring(0, 50)}...</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+            
+            document.getElementById('shows-list').innerHTML = showsHtml;
+            
+            // Pagination
+            const paginationHtml = `
+                <button onclick="loadShows(${page - 1})" ${page === 1 ? 'disabled' : ''}>Previous</button>
+                <span>Page ${page} of ${data.total_pages}</span>
+                <button onclick="loadShows(${page + 1})" ${page >= data.total_pages ? 'disabled' : ''}>Next</button>
+            `;
+            document.getElementById('pagination').innerHTML = paginationHtml;
+        }
+
+        async function loadFailedUrls() {
+            const response = await fetch('/api/database/failed-urls');
+            const data = await response.json();
+            
+            const failedHtml = data.length > 0 ? `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>URL</th>
+                            <th>Error</th>
+                            <th>Time</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${data.map(item => `
+                            <tr>
+                                <td style="word-break: break-all;">${item.url}</td>
+                                <td>${item.error_message || 'Unknown'}</td>
+                                <td>${new Date(item.updated_at).toLocaleString()}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            ` : '<p class="loading">No failed URLs</p>';
+            
+            document.getElementById('failed-list').innerHTML = failedHtml;
+        }
+
+        async function loadCharts() {
+            const response = await fetch('/api/database/stats');
+            const data = await response.json();
+            
+            // Type distribution chart
+            if (typeChart) typeChart.destroy();
+            const typeCtx = document.getElementById('type-chart').getContext('2d');
+            typeChart = new Chart(typeCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Movies', 'Series', 'Anime'],
+                    datasets: [{
+                        data: [data.movies, data.series, data.anime],
+                        backgroundColor: ['#ef4444', '#3b82f6', '#10b981']
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#fff' } }
+                    }
+                }
+            });
+            
+            // Genre chart
+            if (genreChart) genreChart.destroy();
+            const genreCtx = document.getElementById('genre-chart').getContext('2d');
+            genreChart = new Chart(genreCtx, {
+                type: 'bar',
+                data: {
+                    labels: data.top_genres.slice(0, 10).map(g => g[0]),
+                    datasets: [{
+                        label: 'Shows',
+                        data: data.top_genres.slice(0, 10).map(g => g[1]),
+                        backgroundColor: '#00d2ff'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#fff' } }
+                    },
+                    scales: {
+                        y: { ticks: { color: '#fff' } },
+                        x: { ticks: { color: '#fff' } }
+                    }
+                }
+            });
+        }
+
+        // Search debounce
+        let searchTimeout;
+        document.getElementById('search-input').addEventListener('input', () => {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => loadShows(1), 500);
+        });
+
+        // Initial load
+        loadDatabaseStats();
+        setInterval(loadDatabaseStats, 5000);
+    </script>
+</body>
+</html>
