@@ -14,8 +14,8 @@ kill_timeout = 120
 
 # Build: comment out or adjust if you use a Dockerfile or buildpacks.
 # If you have a Dockerfile in project root, Fly will use it automatically.
-#[build]
-#  dockerfile = "Dockerfile"
+[build]
+  dockerfile = "Dockerfile"
 
 # Process commands: start the Flask app
 [processes]
