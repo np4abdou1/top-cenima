@@ -3064,7 +3064,9 @@ def db_view_show(show_id):
         return render_template_string(SHOW_DETAILS_TEMPLATE, show=show, seasons=seasons)
     except Exception as e:
         db.close()
-        return f"Error: {e}", 500
+        # Log error internally but don't expose stack trace to user
+        log_to_ui("status", f"Error loading show details: {e}")
+        return "Error loading show details. Please try again later.", 500
 
 # --- API Endpoints for Show Browser ---
 
@@ -3087,7 +3089,8 @@ def api_get_shows():
         return jsonify({"shows": shows})
     except Exception as e:
         db.close()
-        return jsonify({"error": str(e)}), 500
+        log_to_ui("status", f"Error loading shows: {e}")
+        return jsonify({"error": "Failed to load shows"}), 500
 
 @app.route('/api/shows/<int:show_id>')
 def api_get_show(show_id):
@@ -3114,7 +3117,8 @@ def api_get_show(show_id):
         return jsonify({"show": show})
     except Exception as e:
         db.close()
-        return jsonify({"error": str(e)}), 500
+        log_to_ui("status", f"Error loading show {show_id}: {e}")
+        return jsonify({"error": "Failed to load show details"}), 500
 
 @app.route('/api/episodes/<int:season_id>')
 def api_get_episodes(season_id):
@@ -3136,7 +3140,8 @@ def api_get_episodes(season_id):
         return jsonify({"episodes": episodes})
     except Exception as e:
         db.close()
-        return jsonify({"error": str(e)}), 500
+        log_to_ui("status", f"Error loading episodes for season {season_id}: {e}")
+        return jsonify({"error": "Failed to load episodes"}), 500
 
 @app.route('/api/servers/<parent_type>/<int:parent_id>')
 def api_get_servers(parent_type, parent_id):
@@ -3161,7 +3166,8 @@ def api_get_servers(parent_type, parent_id):
         return jsonify({"servers": servers})
     except Exception as e:
         db.close()
-        return jsonify({"error": str(e)}), 500
+        log_to_ui("status", f"Error loading servers for {parent_type} {parent_id}: {e}")
+        return jsonify({"error": "Failed to load servers"}), 500
 
 # --- Main Execution ---
 
