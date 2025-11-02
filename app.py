@@ -2389,6 +2389,13 @@ DB_PAGE_TEMPLATE = """
         let allShows = [];
         let currentFilter = 'all';
         
+        // HTML escape function to prevent XSS
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
         function setTheme(themeName) {
             document.body.className = themeName;
             localStorage.setItem('scraperTheme', themeName);
@@ -2488,15 +2495,15 @@ DB_PAGE_TEMPLATE = """
             
             grid.innerHTML = shows.map(show => `
                 <div class="show-card" onclick="viewShow(${show.id})">
-                    <div class="type-badge">${show.type}</div>
+                    <div class="type-badge">${escapeHtml(show.type)}</div>
                     ${show.poster ? 
-                        `<img class="poster" src="${show.poster}" alt="${show.title}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                        `<img class="poster" src="${escapeHtml(show.poster)}" alt="${escapeHtml(show.title)}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
                          <div class="poster-placeholder" style="display:none;">📺</div>` :
                         `<div class="poster-placeholder">📺</div>`
                     }
                     <div class="info">
-                        <div class="title">${show.title}</div>
-                        <div class="meta">${show.year || 'N/A'} • ${show.genres || 'Unknown'}</div>
+                        <div class="title">${escapeHtml(show.title)}</div>
+                        <div class="meta">${show.year || 'N/A'} • ${escapeHtml(show.genres || 'Unknown')}</div>
                         ${show.imdb_rating ? `<span class="rating">⭐ ${show.imdb_rating}</span>` : ''}
                     </div>
                 </div>
@@ -2885,7 +2892,16 @@ SHOW_DETAILS_TEMPLATE = """
         
         function playServer(embedUrl, serverNumber) {
             const player = document.getElementById('server-player');
-            player.src = embedUrl;
+            // Basic URL validation - ensure it's a valid URL
+            try {
+                const url = new URL(embedUrl);
+                // Only allow http and https protocols
+                if (url.protocol === 'http:' || url.protocol === 'https:') {
+                    player.src = embedUrl;
+                }
+            } catch (e) {
+                console.error('Invalid embed URL:', embedUrl);
+            }
             
             document.querySelectorAll('.server-btn').forEach(btn => btn.classList.remove('active'));
             document.getElementById(`server-btn-${serverNumber}`).classList.add('active');
@@ -3022,7 +3038,11 @@ def db_view_show(show_id):
     cursor = db.conn.cursor()
     try:
         # Get show details
-        cursor.execute("SELECT * FROM shows WHERE id = ?", (show_id,))
+        cursor.execute("""
+            SELECT id, title, type, poster, synopsis, imdb_rating, trailer, year, 
+                   genres, cast, directors, country, language, duration, source_url, created_at
+            FROM shows WHERE id = ?
+        """, (show_id,))
         show_row = cursor.fetchone()
         
         if not show_row:
@@ -3034,7 +3054,10 @@ def db_view_show(show_id):
         # Get seasons if it's a series or anime
         seasons = []
         if show['type'] in ['series', 'anime']:
-            cursor.execute("SELECT * FROM seasons WHERE show_id = ? ORDER BY season_number", (show_id,))
+            cursor.execute("""
+                SELECT id, show_id, season_number, poster, created_at
+                FROM seasons WHERE show_id = ? ORDER BY season_number
+            """, (show_id,))
             seasons = [dict(row) for row in cursor.fetchall()]
         
         db.close()
@@ -3075,7 +3098,11 @@ def api_get_show(show_id):
     
     cursor = db.conn.cursor()
     try:
-        cursor.execute("SELECT * FROM shows WHERE id = ?", (show_id,))
+        cursor.execute("""
+            SELECT id, title, type, poster, synopsis, imdb_rating, trailer, year, 
+                   genres, cast, directors, country, language, duration, source_url, created_at
+            FROM shows WHERE id = ?
+        """, (show_id,))
         show_row = cursor.fetchone()
         
         if not show_row:
