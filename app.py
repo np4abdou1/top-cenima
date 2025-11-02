@@ -7,11 +7,8 @@ TopCinema Advanced Web Scraper UI (Persistent & Fixed)
 - Safe, single-thread database writer using a queue.
 - Polymorphic DB schema (movies link servers to shows, series link to episodes).
 - Progress is saved to the DB, allowing the script to be stopped and resumed.
-- FIX (User Request): Now scrapes season pages directly, avoiding broken /list/ pagination.
-- FIX (User Request): Robustly parses special (0), decimal (X.Y), and merged (X و Y) episode numbers.
-- FIX (User Request): Uses `source_url` as the UNIQUE key for shows, allowing duplicate titles.
-- NEW (User Request): Added "Sync" feature to update database from a sitemap URL.
-- UI FIX (User Request): Added granular, colored logging and improved log scrolling.
+- FIX: Corrected race condition causing premature writer thread shutdown.
+- FIX: Correctly parses and loads URLs from BOTH json files.
 """
 
 import json
@@ -23,7 +20,7 @@ import threading
 import logging
 import queue
 from typing import List, Dict, Optional, Any, Tuple
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from queue import Queue
@@ -51,7 +48,7 @@ SERVER_PORT = 8080
 # This dictionary is the single source of truth for the web UI
 GLOBAL_STATE = {
     "scraper_running": False,
-    "current_scrape_type": None,  # 'movies', 'series', 'anime', 'sync', or 'all'
+    "current_scrape_type": None,  # 'movies', 'series', 'anime', or 'all'
     "scrape_queue": [],  # Queue of types to scrape in order
     "status_message": "Idle. Ready to start.",
     "progress": {
@@ -66,13 +63,12 @@ GLOBAL_STATE = {
         "anime": 0
     },
     "live_db_log": "...",
-    "live_fetch_logs": deque(maxlen=200) # Increased for longer log history
+    "live_fetch_logs": deque(maxlen=50) # Increased for better log visibility
 }
 
 DATA_QUEUE = Queue()
 STOP_EVENT = threading.Event()
 SCRAPER_THREAD = None
-SYNC_THREAD = None # Thread for the sync operation
 
 # --- Networking Setup ---
 
@@ -115,15 +111,11 @@ if not VERIFY_SSL:
 REGEX_PATTERNS = {
     'number': re.compile(r'(\d+)'),
     'movie': re.compile(r'(\/فيلم-|\/film-|\/movie-|%d9%81%d9%8a%d9%84%d9%85)', re.IGNORECASE),
-    'episode_complex': re.compile(r'(?:الحلقة|Episode)\s*([\d\.\sو]+)', re.IGNORECASE), # FIX: Handles "12 و 13" or "11.5"
-    'episode_special': re.compile(r'الخاصة|Special', re.IGNORECASE), # FIX: Detects special episodes
-    'episode_zero': re.compile(r'(?:الحلقة|Episode)\s+0\s*', re.IGNORECASE), # NEW: Detects episode 0
-    'episode_decimal': re.compile(r'(\d+(?:\.\d+)?)'), # FIX: Extracts first number, including decimals
+    'episode': re.compile(r'(?:الحلقة|Episode)\s*(\d+)'),
     'watch_suffix': re.compile(r'/watch/?$'),
     'episode_id': re.compile(r'"id"\s*:\s*"(\d+)"'),
     'title_clean_prefix': re.compile(r'^\s*(فيلم|انمي|مسلسل|anime|film|movie|series)\s+', re.IGNORECASE | re.UNICODE),
-    'title_clean_suffix': re.compile(r'\s+(مترجم|اون\s*لاين|اونلاين|online|مترجمة|مدبلج|مدبلجة)(\s+|$)', re.IGNORECASE | re.UNICODE),
-    'base_show_url': re.compile(r'(https?:\/\/[^\/]+\/(?:مسلسل|انمي|series|anime)-[^\/]+)\/') # NEW: For sitemap parser
+    'title_clean_suffix': re.compile(r'\s+(مترجم|اون\s*لاين|اونلاين|online|مترجمة|مدبلج|مدبلجة)(\s+|$)', re.IGNORECASE | re.UNICODE)
 }
 
 ARABIC_ORDINALS = {
@@ -187,24 +179,52 @@ def clean_title(title: str) -> str:
     cleaned = ' '.join(cleaned.split()).strip(' -–—|:،؛')
     return cleaned
 
-def get_sort_key(ep_str: Optional[str]) -> float:
+def parse_episode_number(text: str) -> Dict[str, Any]:
+    """Parse episode number info from arbitrary title/text.
+    Returns dict with keys: number (Optional[int]), merged_numbers (List[int]), is_special (bool), is_fractional (bool).
+    - Handles Arabic 'و' (and) merged episodes like '12 و 13'.
+    - Handles fractional like '1115.5' by flooring to int and marking is_fractional.
+    - Detects specials with 'الخاصة' or 'special'.
     """
-    Converts an episode string (e.g., "22-23", "144.5", "0") into a float
-    for correct sorting.
-    """
-    if ep_str is None:
-        return 99999.0
-    # Try to get the first number (float or int) from the string
-    match = REGEX_PATTERNS['episode_decimal'].search(ep_str)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return 99999.0
-    # Fallback for "Special" or other non-numeric, or if parse fails
-    if ep_str.lower() == "special" or ep_str == "0":
-        return 0.0
-    return 99999.0
+    info = {
+        "number": None,
+        "merged_numbers": [],
+        "is_special": False,
+        "is_fractional": False,
+    }
+    if not text:
+        return info
+    t = text.strip().lower()
+    # Special episodes
+    if ('الخاصة' in t) or ('special' in t):
+        info["is_special"] = True
+
+    # Extract all numeric tokens (with optional fraction)
+    nums = re.findall(r'(\d+(?:[\.,]\d+)?)', t)
+    parsed: List[int] = []
+    for n in nums:
+        if ',' in n:
+            n = n.replace(',', '.')
+        if '.' in n:
+            info["is_fractional"] = True
+            try:
+                parsed.append(int(float(n)))
+            except ValueError:
+                continue
+        else:
+            try:
+                parsed.append(int(n))
+            except ValueError:
+                continue
+
+    if parsed:
+        parsed_sorted = sorted(parsed)
+        info["number"] = parsed_sorted[0]
+        # Any additional numbers are considered merged into this episode (single video for multiple eps)
+        if len(parsed_sorted) > 1:
+            info["merged_numbers"] = parsed_sorted[1:]
+
+    return info
 
 # --- Database Initialization ---
 
@@ -216,12 +236,16 @@ def init_database(db_path: str = DB_PATH):
         cursor.execute("PRAGMA foreign_keys = ON")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS shows (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            slug TEXT,
             type TEXT NOT NULL CHECK(type IN ('movie', 'series', 'anime')),
             poster TEXT, synopsis TEXT, imdb_rating REAL, trailer TEXT, year INTEGER,
             genres TEXT, cast TEXT, directors TEXT, country TEXT, language TEXT, duration TEXT,
-            source_url TEXT UNIQUE NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""") # FIX: Removed UNIQUE on title/slug, added UNIQUE on source_url
+            source_url TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(title, type),
+            UNIQUE(slug, type)
+        )""")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS seasons (
             id INTEGER PRIMARY KEY AUTOINCREMENT, show_id INTEGER NOT NULL, season_number INTEGER NOT NULL,
@@ -230,12 +254,10 @@ def init_database(db_path: str = DB_PATH):
         )""")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS episodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, season_id INTEGER NOT NULL, 
-            episode_number TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, season_id INTEGER NOT NULL, episode_number INTEGER NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE, 
-            UNIQUE(season_id, episode_number)
-        )""") # FIX: Changed episode_number from INTEGER to TEXT
+            FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE, UNIQUE(season_id, episode_number)
+        )""")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS servers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, embed_url TEXT NOT NULL, server_number INTEGER NOT NULL,
@@ -331,88 +353,128 @@ def extract_episode_id_from_watch_page(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 def scrape_season_episodes(season_url: str) -> List[Dict]:
-    """Scrapes all episodes and their servers for a given season URL."""
+    """Scrapes all episodes and their servers for a given season URL, across all pagination pages."""
     if STOP_EVENT.is_set(): return []
-    
-    # 1. Fetch season page directly (no /list/ or pagination)
-    soup = fetch_html(season_url)
-    if not soup: 
-        log_to_ui("fetch", f"[ERROR]   > Failed to fetch season page: {season_url}")
+    list_url = season_url.rstrip('/') + '/list/' if not season_url.endswith('/list/') else season_url
+
+    soup = fetch_html(list_url)
+    if not soup: return []
+
+    # Collect all page URLs (pagination)
+    page_urls: List[str] = [list_url]
+    try:
+        pager = soup.select_one('.paginate .page-numbers')
+        if pager:
+            page_links = pager.find_all(['a', 'span'], class_='page-numbers')
+            max_page = 1
+            for el in page_links:
+                txt = el.get_text(strip=True)
+                if txt and txt.isdigit():
+                    try:
+                        max_page = max(max_page, int(txt))
+                    except ValueError:
+                        pass
+            if max_page > 1:
+                # Generate page URLs; prefer using href if present on first link
+                for p in range(2, max_page + 1):
+                    # Some sites provide relative hrefs like '/series/.../list/?page=2'
+                    candidate = f"?page={p}"
+                    page_urls.append(list_url.rstrip('/') + '/' + candidate if '?' not in list_url else list_url.split('?')[0] + candidate)
+    except Exception:
+        pass
+
+    # Alternative: also gather explicit hrefs from pagination to be safe
+    try:
+        pager_links = soup.select('.paginate .page-numbers a.page-numbers[href]')
+        for a in pager_links:
+            href = a.get('href')
+            if href:
+                absu = urljoin(list_url, href)
+                if absu not in page_urls:
+                    page_urls.append(absu)
+    except Exception:
+        pass
+
+    # Deduplicate while preserving order
+    seen_pages = set()
+    page_urls = [u for u in page_urls if not (u in seen_pages or seen_pages.add(u))]
+
+    # Gather episode link infos from all pages
+    link_items: List[Dict[str, str]] = []
+    for pu in page_urls:
+        if STOP_EVENT.is_set(): break
+        psoup = soup if pu == list_url else fetch_html(pu)
+        if not psoup: continue
+        anchors = psoup.select('.allepcont .row > a')
+        if not anchors:
+            anchors = [x for x in psoup.find_all('a') if (x.find(class_='epnum') or (x.get('title') and 'الحلقة' in x.get('title')))]
+        for a in anchors:
+            href = a.get('href')
+            if not href: continue
+            link_items.append({
+                "href": urljoin(list_url, href),
+                "title": a.get('title') or '',
+                "text": a.get_text(' ', strip=True) or ''
+            })
+
+    if not link_items:
+        log_to_ui("fetch", f"  > Found 0 episodes.")
         return []
 
-    # Add anchors from page 1
-    all_anchors = soup.select('.allepcont .row > a')
-    if not all_anchors:
-        all_anchors = [x for x in soup.find_all('a') if (x.find(class_='epnum') or (x.get('title') and ('الحلقة' in x.get('title') or 'Episode' in x.get('title'))))]
-    
-    episodes: List[Dict] = []
-    seen = set()
-    
-    log_to_ui("fetch", f"[DEBUG]   > Found {len(all_anchors)} total episodes.")
+    # Deduplicate by absolute href
+    seen_links = set()
+    unique_items = []
+    for it in link_items:
+        key = it.get('href', '').strip()
+        if not key or key in seen_links:
+            continue
+        seen_links.add(key)
+        unique_items.append(it)
 
-    def process_episode(a):
+    log_to_ui("fetch", f"  > Found {len(unique_items)} episodes across {len(page_urls)} page(s).")
+
+    episodes: List[Dict] = []
+
+    def process_episode(item: Dict[str, str]):
         if STOP_EVENT.is_set(): return None
         try:
-            raw_href = a.get('href')
+            raw_href = item.get('href')
             if not raw_href: return None
-            
-            ep_title = a.get('title', '').strip()
-            ep_num_text = a.get_text(" ", strip=True)
-            full_text_for_parse = f"{ep_title} {ep_num_text}"
-            
-            key = (ep_title.strip() or raw_href.strip())
-            if not key: return None
-            if key in seen: return None
-            seen.add(key)
+            ep_title = item.get('title', '')
+            ep_num_text = item.get('text', '')
 
-            # --- New Episode Number Logic (FIX) ---
-            ep_num_str: Optional[str] = None
-            
-            # Priority 1: Check for "Special" or "Episode 0"
-            if REGEX_PATTERNS['episode_zero'].search(full_text_for_parse) or REGEX_PATTERNS['episode_special'].search(full_text_for_parse):
-                ep_num_str = "0"
-            
-            # Priority 2: If not special, check for complex numbers (e.g., "22 و 23", "1115.5")
-            if ep_num_str is None:
-                complex_match = REGEX_PATTERNS['episode_complex'].search(full_text_for_parse)
-                if complex_match:
-                    num_str = complex_match.group(1).strip() # e.g., "12 و 13", "1115.5"
-                    # Clean the string: "12 و 13" -> "12-13", "1115.5" -> "1115.5"
-                    num_str = num_str.replace('و', '-').strip()
-                    num_str = re.sub(r'\s+', '', num_str)
-                    
-                    # Final check it's a valid-looking number string
-                    if re.search(r'[\d\.-]', num_str):
-                        ep_num_str = num_str
+            info = parse_episode_number(f"{ep_title} {ep_num_text}".strip())
+            ep_num = info.get('number')
+            if ep_num is None:
+                # Fallback to old heuristics
+                ep_num = (extract_number_from_text(ep_title) or extract_number_from_text(ep_num_text))
+            if ep_num is None:
+                # Skip truly unnumbered non-special episodes to avoid DB issues
+                if not info.get('is_special'):
+                    return None
+                # For specials with no number, assign a synthetic high number bucket after normal eps
+                ep_num = 10000
 
-            # Priority 3: Fallback to simple number extraction
-            if ep_num_str is None:
-                 ep_num_int = (extract_number_from_text(ep_title) or extract_number_from_text(ep_num_text))
-                 if ep_num_int is not None:
-                    ep_num_str = str(ep_num_int)
-
-            # If still not found, log it and skip
-            if ep_num_str is None:
-                log_to_ui("fetch", f"[WARN]   > Could not parse ep num for: {ep_title}")
-                return None
-            # --- End New Logic ---
-
-            watch_url = raw_href.rstrip('/') + '/watch/'
+            watch_url = (raw_href.rstrip('/') + '/watch/') if raw_href.startswith('http') else (urljoin(list_url, raw_href).rstrip('/') + '/watch/')
             ep_watch_soup = fetch_html(watch_url)
             episode_id = extract_episode_id_from_watch_page(ep_watch_soup) if ep_watch_soup else None
-            
+
             server_list: List[Dict] = []
             if episode_id:
                 server_list = get_episode_servers(episode_id, referer=watch_url, total_servers=10)
-            
-            return {"episode_number": ep_num_str, "servers": server_list}
-        except Exception as e:
-            log_to_ui("fetch", f"[ERROR]   > processing episode {a.get('href')}: {e}")
+
+            return {
+                "episode_number": int(ep_num),
+                "servers": server_list,
+                "merged_numbers": info.get('merged_numbers', []),
+                "is_special": info.get('is_special', False)
+            }
+        except Exception:
             return None
 
     # Fetch all episodes in parallel (reduced workers to prevent thread errors)
     with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = [ex.submit(process_episode, a) for a in all_anchors]
+        futures = [ex.submit(process_episode, it) for it in unique_items]
         for fut in as_completed(futures):
             if STOP_EVENT.is_set():
                 ex.shutdown(wait=False, cancel_futures=True)
@@ -421,10 +483,25 @@ def scrape_season_episodes(season_url: str) -> List[Dict]:
             if res:
                 episodes.append(res)
 
-    # Sort episodes based on the numeric value of their new string-based number
-    episodes.sort(key=lambda e: get_sort_key(e.get("episode_number")))
-    # Keep all episodes
-    return episodes
+    # Filter out synthetic special bucket 10000 from sorting bias but keep relative order at end
+    episodes.sort(key=lambda e: e.get("episode_number", 999999))
+    # Drop any episodes we failed to parse into a concrete int (shouldn't happen) and remove synthetic bucket only if it causes collision
+    cleaned: List[Dict] = []
+    seen_ep_nums = set()
+    for e in episodes:
+        num = e.get("episode_number")
+        if isinstance(num, int):
+            if num == 10000:
+                # Only include one generic special at the end
+                if num in seen_ep_nums:
+                    continue
+            if num in seen_ep_nums:
+                # Keep the first occurrence
+                continue
+            seen_ep_nums.add(num)
+            cleaned.append(e)
+
+    return cleaned
 
 def extract_media_details(soup: BeautifulSoup) -> Dict:
     """Extracts common details (title, poster, synopsis) from a page."""
@@ -525,7 +602,7 @@ def scrape_series(url: str) -> Optional[Dict]:
         season_urls[1] = url
         seasons.append({"season_number": 1, "poster": details["poster"], "episodes": []})
     
-    log_to_ui("fetch", f"[DEBUG]   > Found {len(seasons)} seasons.")
+    log_to_ui("fetch", f"  > Found {len(seasons)} seasons.")
 
     # Scrape episodes for each season
     for season in seasons:
@@ -567,9 +644,9 @@ def scrape_movie(url: str) -> Optional[Dict]:
     servers = []
     if episode_id:
         servers = get_episode_servers(episode_id, referer=watch_url)
-        log_to_ui("fetch", f"[DEBUG]   > Found {len(servers)} servers.")
+        log_to_ui("fetch", f"  > Found {len(servers)} servers.")
     else:
-        log_to_ui("fetch", f"[WARN]   > No EpisodeID found.")
+        log_to_ui("fetch", f"  > No EpisodeID found.")
         
     trailer_url = get_trailer_embed_url(url, url)
 
@@ -662,7 +739,7 @@ def run_single(url_input: str) -> Tuple[Optional[Dict], Optional[str]]:
                         error_message = "Redflag: No servers found for any episode."
             
             if error_message:
-                log_to_ui("fetch", f"[WARN] ✗ REDFLAG: {result.get('title', 'Show')} - {error_message}")
+                log_to_ui("fetch", f"✗ REDFLAG: {result.get('title', 'Show')} - {error_message}")
                 result = None # Discard the result
 
     except Exception as e:
@@ -695,7 +772,9 @@ class Database:
         cursor = self.conn.cursor()
         try:
             title = show_data.get("title")
-            source_url = show_data.get("source_url") # FIX: Get source_url
+            show_type = show_data.get("type", "series")
+            # Use type-qualified slug to avoid cross-type collisions for same title
+            slug = slugify(f"{show_type}-{title}")
             metadata = show_data.get("metadata", {})
             
             def to_string(value):
@@ -710,27 +789,25 @@ class Database:
                     match = re.search(r'(\d{4})', str(year_str))
                     if match:
                         year = int(match.group(1))
-            
-            show_type = show_data.get("type", "series")
 
             cursor.execute("""
-            INSERT INTO shows (title, type, poster, synopsis, imdb_rating, trailer, year, 
+            INSERT INTO shows (title, slug, type, poster, synopsis, imdb_rating, trailer, year, 
                              genres, cast, directors, country, language, duration, source_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                title, show_type,
+                title, slug, show_type,
                 show_data.get("poster"), show_data.get("synopsis"),
                 show_data.get("imdb_rating"), show_data.get("trailer"), year,
                 to_string(metadata.get("genres")), to_string(metadata.get("cast")),
                 to_string(metadata.get("directors")), to_string(metadata.get("country")),
                 to_string(metadata.get("language")), to_string(metadata.get("duration")),
-                source_url # FIX: Insert source_url
+                show_data.get("source_url")
             ))
             show_id = cursor.lastrowid
             return show_id
         except sqlite3.IntegrityError:
-            # FIX: Check based on source_url
-            cursor.execute("SELECT id FROM shows WHERE source_url = ?", (source_url,))
+            # Match by composite (title, type)
+            cursor.execute("SELECT id FROM shows WHERE title = ? AND type = ?", (title, show_type))
             result = cursor.fetchone()
             return result["id"] if result else None
         except Exception as e:
@@ -922,16 +999,6 @@ class Database:
         except Exception as e:
             log_to_ui("status", f"Error loading initial stats: {e}")
 
-    def get_all_urls_from_progress(self) -> set:
-        """Helper to get all URLs currently in the progress table."""
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("SELECT url FROM scrape_progress")
-            return set(row[0] for row in cursor.fetchall())
-        except Exception as e:
-            log_to_ui("db", f"ERROR getting all URLs: {e}")
-            return set()
-
 def writer_thread_task(db: Database):
     """
     The single, dedicated database writer thread.
@@ -953,7 +1020,6 @@ def writer_thread_task(db: Database):
             result = item.get("result")
             error_msg = item.get("error")
             title = result.get("title", "Unknown") if result else "Unknown"
-            current_type = GLOBAL_STATE["current_scrape_type"] # Check current scrape type
             
             log_to_ui("db", f"WRITING: {title}")
             
@@ -962,17 +1028,13 @@ def writer_thread_task(db: Database):
                 if show_id:
                     if result.get("type") in ["series", "anime"]:
                         db.insert_seasons_episodes_servers(show_id, result.get("seasons", []))
-                        # FIX: Only decrement counts if NOT in sync mode
-                        if current_type != "sync":
-                            if result.get("type") == "anime":
-                                GLOBAL_STATE["counts"]["anime"] -= 1
-                            else:
-                                GLOBAL_STATE["counts"]["series"] -= 1
+                        if result.get("type") == "anime":
+                            GLOBAL_STATE["counts"]["anime"] -= 1
+                        else:
+                            GLOBAL_STATE["counts"]["series"] -= 1
                     else:
                         db.insert_movie_servers(show_id, result.get("streaming_servers", []))
-                         # FIX: Only decrement counts if NOT in sync mode
-                        if current_type != "sync":
-                            GLOBAL_STATE["counts"]["movies"] -= 1
+                        GLOBAL_STATE["counts"]["movies"] -= 1
                     
                     db.mark_progress(url, "completed", show_id)
                     GLOBAL_STATE["progress"]["completed"] += 1
@@ -983,14 +1045,13 @@ def writer_thread_task(db: Database):
                 # This is a failure (scrape fail OR redflag)
                 db.mark_progress(url, "failed", error=error_msg)
                 GLOBAL_STATE["progress"]["failed"] += 1
-                # FIX: Only decrement counts if NOT in sync mode
-                if current_type != "sync":
-                    if "فيلم" in url or "movie" in url:
-                        GLOBAL_STATE["counts"]["movies"] -= 1
-                    elif "انمي" in url or "anime" in url: # FIX: Added 'or "anime" in url'
-                        GLOBAL_STATE["counts"]["anime"] -= 1
-                    elif "مسلسل" in url or "series" in url:
-                        GLOBAL_STATE["counts"]["series"] -= 1
+                # Decrement the correct counter
+                if "فيلم" in url or "movie" in url:
+                    GLOBAL_STATE["counts"]["movies"] -= 1
+                elif "انمي" in url:
+                    GLOBAL_STATE["counts"]["anime"] -= 1
+                elif "مسلسل" in url or "series" in url:
+                    GLOBAL_STATE["counts"]["series"] -= 1
 
             GLOBAL_STATE["progress"]["pending"] -= 1
             commit_counter += 1
@@ -1030,16 +1091,16 @@ def fetcher_task(url: str):
         if result:
             title = result.get("title", "Unknown")
             if result.get("type") == "movie":
-                log_to_ui("fetch", f"[SUCCESS] ✓ Scraped {title} ({len(result.get('streaming_servers', []))} servers)")
+                log_to_ui("fetch", f"✓ Scraped {title} ({len(result.get('streaming_servers', []))} servers)")
             else:
-                log_to_ui("fetch", f"[SUCCESS] ✓ Scraped {title} ({len(result.get('seasons', []))} seasons)")
+                log_to_ui("fetch", f"✓ Scraped {title} ({len(result.get('seasons', []))} seasons)")
             DATA_QUEUE.put({"url": url, "result": result, "error": None})
         else:
             if error and not error.startswith("Redflag"):
-                log_to_ui("fetch", f"[ERROR] ✗ FAILED: {url.split('/')[-2]}")
+                log_to_ui("fetch", f"✗ FAILED: {url.split('/')[-2]}")
             DATA_QUEUE.put({"url": url, "result": None, "error": error})
     except Exception as e:
-        log_to_ui("fetch", f"[ERROR] ✗ ERROR: {url.split('/')[-2]} ({e})")
+        log_to_ui("fetch", f"✗ ERROR: {url.split('/')[-2]} ({e})")
         DATA_QUEUE.put({"url": url, "result": None, "error": str(e)})
 
 def start_scraper_thread(pending_urls: List[str], scrape_type: str = "all"):
@@ -1048,7 +1109,7 @@ def start_scraper_thread(pending_urls: List[str], scrape_type: str = "all"):
     # Determine worker count based on scrape type
     if scrape_type == "movies":
         worker_count = FETCHER_WORKERS_MOVIES
-    elif scrape_type in ["series", "anime", "sync"]: # FIX: Added sync
+    elif scrape_type in ["series", "anime"]:
         worker_count = FETCHER_WORKERS_SERIES
     else:  # "all"
         # Use lower count for safety when scraping all types
@@ -1088,8 +1149,7 @@ def start_scraper_thread(pending_urls: List[str], scrape_type: str = "all"):
     writer.join() # Wait for writer to finish
     
     # 4. Check if there's a next type to scrape
-    # FIX: Do not auto-chain if this was a 'sync' task
-    if GLOBAL_STATE["scrape_queue"] and not STOP_EVENT.is_set() and scrape_type != "sync":
+    if GLOBAL_STATE["scrape_queue"] and not STOP_EVENT.is_set():
         next_type = GLOBAL_STATE["scrape_queue"].pop(0)
         log_to_ui("status", f"Auto-starting next scrape type: {next_type}")
         GLOBAL_STATE["current_scrape_type"] = next_type
@@ -1113,77 +1173,6 @@ def start_scraper_thread(pending_urls: List[str], scrape_type: str = "all"):
         GLOBAL_STATE["current_scrape_type"] = None
         GLOBAL_STATE["scrape_queue"] = []
         log_to_ui("status", "All scraping tasks completed!")
-
-def sync_thread_task(sitemap_url: str):
-    """Fetches sitemap, parses URLs, finds new/updated shows, and starts scraper."""
-    try:
-        log_to_ui("status", f"Starting sync from {sitemap_url}...")
-        soup = fetch_html(sitemap_url)
-        
-        if not soup:
-            log_to_ui("status", f"ERROR: Could not fetch sitemap URL.")
-            GLOBAL_STATE["scraper_running"] = False
-            GLOBAL_STATE["current_scrape_type"] = None
-            return
-
-        urls_to_scrape = set()
-        sitemap_links = soup.select("#content table tbody tr a")
-
-        log_to_ui("status", f"Parsing {len(sitemap_links)} links from sitemap...")
-
-        for link in sitemap_links:
-            href = link.get('href')
-            if not href: continue
-
-            if "فيلم" in href or REGEX_PATTERNS['movie'].search(href):
-                urls_to_scrape.add(href)
-            else:
-                match = REGEX_PATTERNS['base_show_url'].search(href)
-                if match:
-                    base_url = match.group(1) + '/'
-                    urls_to_scrape.add(base_url)
-        
-        log_to_ui("status", f"Found {len(urls_to_scrape)} unique shows/movies to sync.")
-        if not urls_to_scrape:
-            log_to_ui("status", "Sync complete. No items found.")
-            GLOBAL_STATE["scraper_running"] = False
-            GLOBAL_STATE["current_scrape_type"] = None
-            return
-
-        db = Database(DB_PATH)
-        cursor = db.conn.cursor()
-        existing_urls = db.get_all_urls_from_progress()
-        
-        pending_urls = []
-        new_item_count = 0
-
-        for url in urls_to_scrape:
-            if url not in existing_urls:
-                cursor.execute("INSERT OR IGNORE INTO scrape_progress (url) VALUES (?)", (url,))
-                pending_urls.append(url)
-                new_item_count += 1
-            else:
-                # It's an existing show, re-scrape it to check for new episodes
-                pending_urls.append(url)
-        
-        db.conn.commit()
-        db.close()
-
-        log_to_ui("status", f"Found {new_item_count} new items. Syncing {len(pending_urls)} total items...")
-        
-        # Reload stats to update totals
-        load_initial_stats()
-        # Override pending count to just what we are scraping
-        GLOBAL_STATE["progress"]["pending"] = len(pending_urls)
-        
-        # Call the main scraper engine with our prepared list
-        start_scraper_thread(pending_urls, "sync")
-
-    except Exception as e:
-        log_to_ui("status", f"ERROR during sync: {e}")
-        GLOBAL_STATE["scraper_running"] = False
-        GLOBAL_STATE["current_scrape_type"] = None
-
     
 # --- Flask Web Server ---
 
@@ -1198,7 +1187,7 @@ def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>SCRAPER-TERMINAL v2.2 (UI Fix)</title>
+        <title>SCRAPER-TERMINAL v2.0</title>
         <style>
             @import url('https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap');
             
@@ -1290,11 +1279,15 @@ def index():
                 94% { text-shadow: -2px 0 0 #ff0055, 2px 0 0 #00ffff; }
             }
             
+            .terminal-time {
+                font-size: 14px;
+                color: var(--text-dim);
+            }
+            
             .controls {
                 display: flex;
                 gap: 10px;
                 flex-wrap: wrap;
-                margin-bottom: 15px; /* Added margin */
             }
             
             .controls button {
@@ -1361,48 +1354,6 @@ def index():
             
             .controls button.stopped {
                 display: none;
-            }
-
-            /* NEW: Sitemap controls */
-            .controls-sitemap {
-                display: flex;
-                gap: 10px;
-                width: 100%;
-            }
-            .controls-sitemap input[type="text"] {
-                flex: 1;
-                background: var(--terminal-bg);
-                border: 2px solid var(--border-color);
-                color: var(--text-color);
-                padding: 12px 20px;
-                font-family: 'Share Tech Mono', monospace;
-                font-size: 14px;
-                border-radius: 8px;
-            }
-            .controls-sitemap input[type="text"]::placeholder {
-                color: var(--text-dim);
-            }
-            .controls-sitemap button {
-                font-family: 'Share Tech Mono', monospace;
-                font-size: 14px;
-                padding: 12px 20px;
-                border: 2px solid var(--warn-color);
-                background: var(--terminal-bg);
-                color: var(--warn-color);
-                cursor: pointer;
-                transition: all 0.2s;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-                border-radius: 8px;
-            }
-            .controls-sitemap button:hover:not(:disabled) {
-                background: var(--warn-color);
-                color: var(--terminal-bg);
-                box-shadow: 0 0 15px var(--warn-color);
-            }
-            .controls-sitemap button:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
             }
             
             .terminal-panel {
@@ -1598,20 +1549,18 @@ def index():
                 to { opacity: 1; transform: translateX(0); }
             }
             
-            .log-line.success {
-                color: var(--success-color);
+            .log-line::before {
+                content: '$ ';
+                color: var(--text-dim);
             }
-            .log-line.success::before {
-                content: '✓ ';
+            
+            .log-line.success {
                 color: var(--success-color);
             }
             
             .log-line.error {
                 color: var(--fail-color);
-            }
-            .log-line.error::before {
-                content: '✗ ';
-                color: var(--fail-color);
+                animation: shake 0.3s;
             }
             
             @keyframes shake {
@@ -1623,33 +1572,8 @@ def index():
             .log-line.warn {
                 color: var(--warn-color);
             }
-            .log-line.warn::before {
-                content: 'WARN: ';
-                color: var(--warn-color);
-            }
-
-            .log-line.debug {
-                color: var(--accent-color); /* Cyan */
-            }
-            .log-line.debug::before {
-                content: '> ';
-                color: var(--accent-color);
-            }
-
-            .log-line.start {
-                color: var(--text-color); /* Green */
-                font-weight: bold;
-            }
-            .log-line.start::before {
-                content: 'START: ';
-                color: var(--text-dim);
-            }
-
+            
             .log-line.info {
-                color: var(--text-dim);
-            }
-            .log-line.info::before {
-                content: '$ ';
                 color: var(--text-dim);
             }
             
@@ -1695,7 +1619,7 @@ def index():
         <div class="container">
             <header>
                 <div class="terminal-header">
-                    <h1>█ SCRAPER-TERMINAL v2.2 █</h1>
+                    <h1>█ SCRAPER-TERMINAL v2.0 █</h1>
                     <div class="terminal-time" id="current-time">--:--:--</div>
                 </div>
                 <div class="controls">
@@ -1703,10 +1627,6 @@ def index():
                     <button id="start-series-btn">▶ SERIES</button>
                     <button id="start-anime-btn">▶ ANIME</button>
                     <button id="stop-btn" class="stop-btn stopped">⏹ ABORT</button>
-                </div>
-                <div class="controls-sitemap">
-                    <input type="text" id="sitemap-url-input" placeholder="https://topcinema.pro/sitemap-pt-post-2025-11.html">
-                    <button id="start-sync-btn">⟳ SYNC</button>
                 </div>
             </header>
 
@@ -1767,8 +1687,6 @@ def index():
             const startMoviesBtn = document.getElementById('start-movies-btn');
             const startSeriesBtn = document.getElementById('start-series-btn');
             const startAnimeBtn = document.getElementById('start-anime-btn');
-            const startSyncBtn = document.getElementById('start-sync-btn'); // NEW
-            const sitemapUrlInput = document.getElementById('sitemap-url-input'); // NEW
             const stopBtn = document.getElementById('stop-btn');
             const statusMsg = document.getElementById('status-message');
             const statusLed = document.getElementById('status-led');
@@ -1798,7 +1716,6 @@ def index():
 
             // Auto-scroll management
             fetchLogEl.addEventListener('scroll', () => {
-                // If scroll position is not at the bottom (with a 50px tolerance), set flag
                 const isAtBottom = fetchLogEl.scrollHeight - fetchLogEl.scrollTop <= fetchLogEl.clientHeight + 50;
                 userScrolledUp = !isAtBottom;
             });
@@ -1807,12 +1724,6 @@ def index():
                 // Update buttons based on running state
                 const isRunning = data.scraper_running;
                 const currentType = data.current_scrape_type;
-                
-                // Disable all start buttons if running
-                startMoviesBtn.disabled = isRunning;
-                startSeriesBtn.disabled = isRunning;
-                startAnimeBtn.disabled = isRunning;
-                startSyncBtn.disabled = isRunning;
                 
                 if (isRunning) {
                     statusLed.classList.add('active');
@@ -1830,9 +1741,6 @@ def index():
                         startMoviesBtn.classList.remove('running');
                         startSeriesBtn.classList.remove('running');
                         startAnimeBtn.classList.add('running');
-                    } else if (currentType === 'sync') {
-                        startSyncBtn.classList.add('running');
-                        startSyncBtn.textContent = 'SYNCING...';
                     }
                 } else {
                     statusLed.classList.remove('active');
@@ -1840,8 +1748,6 @@ def index():
                     startMoviesBtn.classList.remove('running');
                     startSeriesBtn.classList.remove('running');
                     startAnimeBtn.classList.remove('running');
-                    startSyncBtn.classList.remove('running');
-                    startSyncBtn.textContent = '⟳ SYNC';
                 }
                 
                 // Update status message
@@ -1877,29 +1783,19 @@ def index():
                 // Update DB Log
                 dbLogEl.textContent = data.live_db_log || 'Idle...';
                 
-                // Update Fetch Logs
+                // Update Fetch Logs with auto-scroll management
+                const wasAtBottom = fetchLogEl.scrollHeight - fetchLogEl.scrollTop <= fetchLogEl.clientHeight + 50;
+                
                 fetchLogEl.innerHTML = (data.live_fetch_logs || []).map(log => {
-                    let level = 'info'; // Default
-                    if (log.startsWith('[SUCCESS]')) {
-                        level = 'success';
-                    } else if (log.startsWith('[ERROR]')) {
-                        level = 'error';
-                    } else if (log.startsWith('[WARN]') || log.startsWith('✗ REDFLAG')) {
-                        level = 'warn';
-                    } else if (log.startsWith('[DEBUG]')) {
-                        level = 'debug';
-                    } else if (log.startsWith('START:')) {
-                        level = 'start';
-                    }
-                    
-                    // Clean the log message (remove prefix for display)
-                    const displayLog = log.replace(/^\[\w+\]\s*/, ''); 
-                    
-                    return `<div class="log-line ${level}">${displayLog}</div>`;
+                    let level = 'info';
+                    if (log.startsWith('✓') || log.includes('Found')) level = 'success';
+                    else if (log.startsWith('✗') || log.includes('ERROR') || log.includes('REDFLAG')) level = 'error';
+                    else if (log.startsWith('  >') || log.includes('START:')) level = 'warn';
+                    return `<div class="log-line ${level}">${log}</div>`;
                 }).join('');
                 
-                // Auto-scroll only if user hasn't scrolled up
-                if (!userScrolledUp) {
+                // Auto-scroll only if user was at bottom (or never scrolled)
+                if (!userScrolledUp || wasAtBottom) {
                     fetchLogEl.scrollTop = fetchLogEl.scrollHeight;
                 }
             }
@@ -1927,50 +1823,23 @@ def index():
                     statusMsg.textContent = `ERROR STARTING ${type.toUpperCase()} SCRAPER`;
                 }
             }
-            
-            async function startSync() {
-                const url = sitemapUrlInput.value;
-                if (!url) {
-                    statusMsg.textContent = "SITEMAP URL IS REQUIRED";
-                    return;
-                }
-                if (!url.startsWith('http')) {
-                    statusMsg.textContent = "INVALID SITEMAP URL";
-                    return;
-                }
-                
-                try {
-                    const response = await fetch(`/api/sync`, { 
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({ url: url })
-                    });
-                    const result = await response.json();
-                    if (!result.success) {
-                        statusMsg.textContent = result.message.toUpperCase();
-                    }
-                    fetchStatus();
-                } catch (e) {
-                    statusMsg.textContent = `ERROR STARTING SYNC`;
-                }
-            }
 
             startMoviesBtn.addEventListener('click', async () => {
+                startMoviesBtn.disabled = true;
                 await startScraper('movies');
+                setTimeout(() => startMoviesBtn.disabled = false, 1000);
             });
 
             startSeriesBtn.addEventListener('click', async () => {
+                startSeriesBtn.disabled = true;
                 await startScraper('series');
+                setTimeout(() => startSeriesBtn.disabled = false, 1000);
             });
 
             startAnimeBtn.addEventListener('click', async () => {
+                startAnimeBtn.disabled = true;
                 await startScraper('anime');
-            });
-            
-            startSyncBtn.addEventListener('click', async () => {
-                await startSync();
+                setTimeout(() => startAnimeBtn.disabled = false, 1000);
             });
 
             stopBtn.addEventListener('click', async () => {
@@ -2027,7 +1896,7 @@ def api_start(scrape_type):
             GLOBAL_STATE["scrape_queue"] = ["movies", "series"]
         
         STOP_EVENT.clear()
-        # GLOBAL_STATE["live_fetch_logs"].clear() # FIX: Don't clear logs
+        GLOBAL_STATE["live_fetch_logs"].clear()
         GLOBAL_STATE["live_db_log"] = "..."
         
         # Load stats in the main thread to prevent race condition
@@ -2050,34 +1919,6 @@ def api_start(scrape_type):
         return jsonify({"success": True, "message": f"Scraper started for {scrape_type}. Will auto-chain to next types."})
     return jsonify({"success": False, "message": "Scraper already running."})
 
-@app.route('/api/sync', methods=['POST'])
-def api_sync():
-    """
-    Starts the sitemap sync and update process.
-    """
-    global SYNC_THREAD
-    
-    sitemap_url = request.json.get('url')
-    if not sitemap_url:
-        return jsonify({"success": False, "message": "Sitemap URL is required."}), 400
-    
-    if not GLOBAL_STATE['scraper_running']:
-        GLOBAL_STATE["scraper_running"] = True
-        GLOBAL_STATE["current_scrape_type"] = "sync"
-        GLOBAL_STATE["scrape_queue"] = [] # Sync does not chain
-        
-        STOP_EVENT.clear()
-        # GLOBAL_STATE["live_fetch_logs"].clear() # FIX: Don't clear logs
-        GLOBAL_STATE["live_db_log"] = "..."
-        
-        # Start the sync process in a new thread
-        SYNC_THREAD = threading.Thread(target=sync_thread_task, args=(sitemap_url,), daemon=True)
-        SYNC_THREAD.start()
-        
-        return jsonify({"success": True, "message": f"Sync started from {sitemap_url}."})
-    return jsonify({"success": False, "message": "Scraper already running."})
-
-
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
     """Sets the stop event to gracefully shut down the scraper and clear the queue."""
@@ -2087,6 +1928,36 @@ def api_stop():
         GLOBAL_STATE["scrape_queue"] = []  # Clear the auto-chain queue
         return jsonify({"success": True, "message": "Stop signal sent."})
     return jsonify({"success": False, "message": "Scraper not running."})
+
+@app.route('/api/reset', methods=['POST'])
+def api_reset():
+    """Deletes the scraper database to prepare for a fresh rescrape, then reinitializes schema."""
+    try:
+        # Stop any current runs
+        if GLOBAL_STATE['scraper_running']:
+            STOP_EVENT.set()
+            GLOBAL_STATE["scrape_queue"] = []
+            GLOBAL_STATE["scraper_running"] = False
+            GLOBAL_STATE["current_scrape_type"] = None
+
+        # Remove DB file
+        try:
+            if os.path.exists(DB_PATH):
+                os.remove(DB_PATH)
+        except Exception as e:
+            return jsonify({"success": False, "message": f"Failed to delete DB: {e}"}), 500
+
+        # Recreate schema
+        init_database(DB_PATH)
+        # Reset UI state counters
+        GLOBAL_STATE["progress"] = {"pending": 0, "completed": 0, "failed": 0, "total": 0}
+        GLOBAL_STATE["counts"] = {"movies": 0, "series": 0, "anime": 0}
+        GLOBAL_STATE["live_fetch_logs"].clear()
+        GLOBAL_STATE["live_db_log"] = "DB reset."
+        log_to_ui("status", "Database reset complete. Ready for fresh rescrape.")
+        return jsonify({"success": True, "message": "Database reset complete."})
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Reset failed: {e}"}), 500
 
 # --- Main Execution ---
 
