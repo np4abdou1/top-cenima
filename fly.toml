@@ -23,6 +23,7 @@ kill_timeout = 120
 
 # HTTP service exposing internal port 8080
 [[services]]
+  processes = ["app"]
   internal_port = 8080
   protocol = "tcp"
   auto_stop_machines = "stop"
