@@ -1,53 +1,20 @@
 app = "top-cinema-scraper"
 primary_region = "ord"
 
-# Graceful shutdown
-kill_signal = "SIGTERM"
-kill_timeout = 120
+[build]
 
 [env]
-  # keep Python output unbuffered for real-time logs
-  PYTHONUNBUFFERED = "1"
-  FLASK_ENV = "production"
-  # App listens on port 8080 by code; keep consistent
   PORT = "8080"
 
-# Build: comment out or adjust if you use a Dockerfile or buildpacks.
-# If you have a Dockerfile in project root, Fly will use it automatically.
-[build]
-  dockerfile = "Dockerfile"
-
-# HTTP service exposing internal port 8080
-[[services]]
+[http_service]
   internal_port = 8080
-  protocol = "tcp"
-  auto_stop_machines = "stop"
+  force_https = true
+  auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 0
+  processes = ["app"]
 
-  [services.concurrency]
-    type = "requests"
-    soft_limit = 50
-    hard_limit = 200
-
-  [[services.ports]]
-    handlers = ["http"]
-    port = 80
-
-  [[services.ports]]
-    handlers = ["tls","http"]
-    port = 443
-
-  # Basic HTTP healthcheck for readiness
-  [[services.http_checks]]
-    interval = 10000
-    grace_period = "5s"
-    method = "get"
-    path = "/"
-    protocol = "http"
-    timeout = 5000
-
-# Optional: metrics export (enable if your app exposes /metrics)
-#[metrics]
-#  port = 9091
-#  path = "/metrics"
+[http_service.concurrency]
+  type = "connections"
+  hard_limit = 25
+  soft_limit = 20
